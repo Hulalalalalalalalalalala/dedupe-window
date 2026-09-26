@@ -8,15 +8,32 @@ retained.  Two eviction rules apply:
 * span: :meth:`Window.advance` drops every key whose first sighting is more
   than ``span`` behind the current time.
 
-Single process only; no cross-process locking.
+Persistence is a crash-safe atomic commit: :meth:`Window.save` writes a
+checksummed document to a temporary file in the state directory and
+atomically renames it over the single data file, so a crash mid-write
+leaves the previous commit intact.  Processes coordinate through an
+``flock`` lock on the state directory, so concurrent writers serialize
+instead of clobbering each other, and a process dying while holding the
+lock releases it automatically.
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
+import tempfile
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
 
 _STATE_FILE = "window.json"
+_TEMP_PREFIX = _STATE_FILE + "."
+_TEMP_SUFFIX = ".tmp"
+_SIGNED_FIELDS = ("span", "capacity", "now", "admitted", "expired", "keys")
 
 
 def _is_number(value):
@@ -27,6 +44,12 @@ def _is_number(value):
 def _check_key(key):
     if not isinstance(key, str):
         raise TypeError("key must be a string")
+
+
+def _digest(payload):
+    """A deterministic integrity digest over a state document."""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class Window:
@@ -49,7 +72,38 @@ class Window:
         self._index = {}    # key -> first_seen, mirrors _entries
         self._admitted = 0
         self._expired = 0
-        os.makedirs(self._state_dir, exist_ok=True)
+        self._lock_depth = 0
+
+    @contextlib.contextmanager
+    def _locked(self, create=False):
+        """Hold the state directory's file lock; re-entrant per window.
+
+        The lock is an ``flock`` on the directory itself, so it leaves no
+        extra file behind and is released by the kernel if the holder dies.
+        """
+        if self._lock_depth:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
+        if create:
+            os.makedirs(self._state_dir, exist_ok=True)
+        if fcntl is None:
+            yield
+            return
+        fd = os.open(self._state_dir, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self._lock_depth = 1
+            try:
+                yield
+            finally:
+                self._lock_depth = 0
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def observe(self, key):
         """Record a sighting; return True only when the key is newly admitted."""
@@ -99,8 +153,12 @@ class Window:
         }
 
     def save(self):
-        """Write the whole window state to ``window.json`` in the state directory."""
-        os.makedirs(self._state_dir, exist_ok=True)
+        """Atomically replace the state file with a checksummed snapshot.
+
+        The document is written to a temporary file next to the data file
+        and renamed over it, so a crash mid-write cannot truncate the last
+        committed state and no intermediate file survives the rename.
+        """
         payload = {
             "span": self._span,
             "capacity": self._capacity,
@@ -109,33 +167,83 @@ class Window:
             "expired": self._expired,
             "keys": [[key, first] for key, first in self._entries],
         }
-        path = os.path.join(self._state_dir, _STATE_FILE)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh)
+        payload["checksum"] = _digest(
+            {field: payload[field] for field in _SIGNED_FIELDS}
+        )
+        text = json.dumps(payload)
+        with self._locked(create=True):
+            self._discard_stale_temps()
+            fd, tmp = tempfile.mkstemp(
+                dir=self._state_dir, prefix=_TEMP_PREFIX, suffix=_TEMP_SUFFIX
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, os.path.join(self._state_dir, _STATE_FILE))
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+            self._fsync_dir()
+
+    def _discard_stale_temps(self):
+        """Remove temp files left behind by a crashed writer.
+
+        Only called while holding the lock, and temp files are only created
+        under the lock, so any temp file still present is stale.
+        """
+        for name in os.listdir(self._state_dir):
+            if name.startswith(_TEMP_PREFIX) and name.endswith(_TEMP_SUFFIX):
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(self._state_dir, name))
+
+    def _fsync_dir(self):
+        """Best-effort durability barrier for the rename itself."""
+        try:
+            fd = os.open(self._state_dir, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            with contextlib.suppress(OSError):
+                os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def load(self):
         """Re-read the state file and replace memory only once it checks out."""
         path = os.path.join(self._state_dir, _STATE_FILE)
-        with open(path, "r", encoding="utf-8") as fh:
-            raw = fh.read()
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"state file is not valid JSON: {exc}") from exc
-        now, admitted, expired, entries = self._restore(data)
-        self._now = now
-        self._admitted = admitted
-        self._expired = expired
-        self._entries = entries
-        self._index = {key: first for key, first in entries}
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"state file not found: {path}")
+        with self._locked():
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"state file is not valid JSON: {exc}") from exc
+            now, admitted, expired, entries = self._restore(data)
+            self._now = now
+            self._admitted = admitted
+            self._expired = expired
+            self._entries = entries
+            self._index = {key: first for key, first in entries}
 
     def _restore(self, data):
         """Validate a decoded state document without touching the window."""
         if not isinstance(data, dict):
             raise ValueError("state file must hold a JSON object")
-        missing = {"span", "capacity", "now", "admitted", "expired", "keys"} - data.keys()
+        required = set(_SIGNED_FIELDS) | {"checksum"}
+        missing = required - data.keys()
         if missing:
             raise ValueError(f"state file is missing fields: {sorted(missing)}")
+        checksum = data["checksum"]
+        if not isinstance(checksum, str):
+            raise ValueError("state file has an invalid checksum")
+        signed = {field: data[field] for field in _SIGNED_FIELDS}
+        if _digest(signed) != checksum:
+            raise ValueError("state file checksum does not match its contents")
         span = data["span"]
         capacity = data["capacity"]
         now = data["now"]

@@ -32,6 +32,8 @@ Python 3.11 or newer. Standard library only.
 
 ## Limits
 
-Single process; no cross-process locking.
+Single host; no network. Concurrent processes on the same state directory
+serialize through a file lock, and `save` commits atomically, so a crash
+mid-write leaves the last committed state intact.
 Keys are text; no value is stored with them.
 Span and capacity are the only eviction rules.

@@ -58,41 +58,53 @@ def _parse(argv):
     return state, command, operands
 
 
-def _open_window(state):
-    """Load the persisted window, or start an empty one with the defaults."""
-    path = os.path.join(state, "window.json")
-    span, capacity = DEFAULT_SPAN, DEFAULT_CAPACITY
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                settings = json.load(fh)
-            span = settings["span"]
-            capacity = settings["capacity"]
-        except Exception:
-            _corrupt("cannot read span and capacity")
+def _settings(path):
+    """Span and capacity from an existing state file, else the defaults."""
+    if not os.path.exists(path):
+        return DEFAULT_SPAN, DEFAULT_CAPACITY
     try:
-        window = Window(state, span, capacity)
+        with open(path, "r", encoding="utf-8") as fh:
+            settings = json.load(fh)
+        return settings["span"], settings["capacity"]
+    except Exception:
+        _corrupt("cannot read span and capacity")
+
+
+def _new_window(state, path):
+    try:
+        return Window(state, *_settings(path))
     except (TypeError, ValueError) as exc:
         _corrupt(str(exc))
-    if os.path.exists(path):
-        try:
-            window.load()
-        except ValueError as exc:
-            _corrupt(str(exc))
-    return window
+
+
+def _load_existing(window, path):
+    if not os.path.exists(path):
+        return
+    try:
+        window.load()
+    except FileNotFoundError:
+        pass  # The file vanished between the check and the read; start empty.
+    except ValueError as exc:
+        _corrupt(str(exc))
 
 
 def main(argv=None):
     state, command, operands = _parse(list(sys.argv[1:] if argv is None else argv))
-    os.makedirs(state, exist_ok=True)
-    window = _open_window(state)
+    path = os.path.join(state, "window.json")
+    window = _new_window(state, path)
     if command == "observe":
-        result = window.observe(operands[0])
-        window.save()
+        # Load, mutate and save as one locked commit, so concurrent
+        # processes queue up instead of losing each other's updates.
+        with window._locked(create=True):
+            _load_existing(window, path)
+            result = window.observe(operands[0])
+            window.save()
         print(json.dumps(result))
     elif command == "seen":
+        _load_existing(window, path)
         print(json.dumps(window.seen(operands[0])))
     else:
+        _load_existing(window, path)
         print(json.dumps(window.stats(), separators=(",", ":")))
     return 0
 

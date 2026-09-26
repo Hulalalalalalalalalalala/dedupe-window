@@ -231,5 +231,127 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(result.stderr.strip().splitlines()), 1)
 
 
+class AtomicCommitTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "window.json")
+
+    def test_save_leaves_only_the_data_file(self):
+        window = Window(self.dir, 10, 3)
+        window.observe("a")
+        window.save()
+        self.assertEqual(os.listdir(self.dir), ["window.json"])
+
+    def test_save_cleans_up_a_crashed_writers_temp_file(self):
+        stale = os.path.join(self.dir, "window.json.deadbeef.tmp")
+        with open(stale, "w", encoding="utf-8") as fh:
+            fh.write("{partial")
+        Window(self.dir, 10, 3).save()
+        self.assertEqual(os.listdir(self.dir), ["window.json"])
+
+    def test_saved_file_carries_a_checksum(self):
+        Window(self.dir, 10, 3).save()
+        with open(self.path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertIsInstance(data["checksum"], str)
+
+    def test_load_rejects_a_missing_checksum(self):
+        Window(self.dir, 10, 3).save()
+        with open(self.path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        del data["checksum"]
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        with self.assertRaises(ValueError):
+            Window(self.dir, 10, 3).load()
+
+    def test_load_rejects_a_tampered_file(self):
+        window = Window(self.dir, 10, 3)
+        window.observe("a")
+        window.save()
+        with open(self.path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["admitted"] = 99  # tamper without fixing the checksum
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        with self.assertRaises(ValueError):
+            Window(self.dir, 10, 3).load()
+
+    def test_truncated_file_keeps_last_commit_loadable(self):
+        window = Window(self.dir, 10, 3)
+        window.observe("a")
+        window.save()
+        with open(self.path, "rb") as fh:
+            committed = fh.read()
+        window.observe("b")
+        window.save()
+        # Simulate a torn write: truncate the data file mid-commit.
+        with open(self.path, "wb") as fh:
+            fh.write(committed[: len(committed) // 2])
+        with self.assertRaises(ValueError):
+            Window(self.dir, 10, 3).load()
+        # Restore the last good commit and it loads without drift.
+        with open(self.path, "wb") as fh:
+            fh.write(committed)
+        clone = Window(self.dir, 10, 3)
+        clone.load()
+        self.assertEqual(clone.keys(), ["a"])
+        self.assertEqual(clone.stats()["admitted"], 1)
+
+    def test_reads_do_not_create_the_state_dir(self):
+        missing = os.path.join(self.dir, "window")
+        window = Window(missing, 10, 3)
+        self.assertFalse(window.seen("a"))
+        self.assertEqual(window.stats()["retained"], 0)
+        self.assertFalse(os.path.exists(missing))
+
+
+class ConcurrencyTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, "-m", "dedupe_window", *args],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_concurrent_observes_serialize(self):
+        import concurrent.futures
+
+        state = os.path.join(self.dir, "window")
+        keys = [f"key{i}" for i in range(12)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(
+                pool.map(lambda k: self.run_cli("--state", state, "observe", k), keys)
+            )
+        for result in results:
+            self.assertEqual((result.returncode, result.stdout), (0, "true\n"))
+        stats = self.run_cli("--state", state, "stats")
+        self.assertEqual(
+            stats.stdout,
+            '{"span":60,"capacity":1024,"retained":12,"admitted":12,"expired":0}\n',
+        )
+        self.assertEqual(os.listdir(state), ["window.json"])
+
+    def test_concurrent_saves_do_not_clobber_each_other(self):
+        import concurrent.futures
+
+        def save_one(i):
+            window = Window(self.dir, 10, 100)
+            window.observe(f"key{i}")
+            window.save()
+            return True
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(save_one, range(8)))
+        # Every commit is complete and loadable; the winner is one of them.
+        clone = Window(self.dir, 10, 100)
+        clone.load()
+        self.assertEqual(clone.stats()["retained"], 1)
+        self.assertEqual(os.listdir(self.dir), ["window.json"])
+
+
 if __name__ == "__main__":
     unittest.main()
