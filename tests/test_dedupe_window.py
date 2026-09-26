@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -285,7 +286,8 @@ class AtomicCommitTests(unittest.TestCase):
         Window(self.dir, 10, 3).save()
         doc = self._document()
         self.assertIn("checksum", doc)
-        self.assertEqual(doc["version"], 1)
+        self.assertEqual(doc["version"], 2)
+        self.assertEqual(doc["kind"], "base")
         self.assertEqual(len(doc["checksum"]), 64)
 
     def test_missing_integrity_field_is_value_error(self):
@@ -334,6 +336,165 @@ class AtomicCommitTests(unittest.TestCase):
             fh.write("partial")
         window.observe("a")
         self.assertEqual(sorted(os.listdir(self.dir)), ["window.json"])
+
+
+class SegmentedStateTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "window.json")
+
+    def _raw(self):
+        with open(self.path, "rb") as fh:
+            return fh.read()
+
+    def _lines(self):
+        return self._raw().decode("utf-8").splitlines()
+
+    def _write_v1(self, keys, now=0, admitted=0, expired=0, span=10, capacity=3):
+        body = {"version": 1, "span": span, "capacity": capacity, "now": now,
+                "admitted": admitted, "expired": expired, "keys": keys}
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        envelope = dict(body)
+        envelope["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def test_commits_append_segments_not_full_mirrors(self):
+        window = Window(self.dir, 10, 3)
+        window.observe("a")
+        window.observe("b")
+        lines = self._lines()
+        self.assertEqual(len(lines), 2)
+        base = json.loads(lines[0])
+        self.assertEqual((base["version"], base["kind"]), (2, "base"))
+        segment = json.loads(lines[1])
+        self.assertEqual((segment["kind"], segment["op"]), ("delta", "admit"))
+        self.assertEqual(segment["add"], [["b", 0]])
+        self.assertEqual(segment["prev"], base["checksum"])
+
+    def test_segments_chain_and_replay_exactly(self):
+        window = Window(self.dir, 10, 3)
+        for key in "abcd":  # capacity 3: "a" is evicted by "d"
+            window.observe(key)
+        window.advance(4)
+        window.observe("e")
+        window.advance(12)
+        clone = Window(self.dir, 10, 3)
+        clone.load()
+        self.assertEqual(clone.keys(), window.keys())
+        self.assertEqual(clone.stats(), window.stats())
+
+    def test_write_volume_stays_proportional_to_the_change(self):
+        window = Window(self.dir, 10**9, 100000)
+        for i in range(2000):
+            window.observe(f"key-{i}")
+        size = os.path.getsize(self.path)
+        self.assertGreater(size, 20000)  # a real state, not a toy
+        for i in range(2000, 2010):
+            window.observe(f"key-{i}")
+        growth = os.path.getsize(self.path) - size
+        # Ten commits grew the file by a few small segments (or compacted,
+        # which shrinks it) -- never by another full mirror of the state.
+        self.assertLess(growth, size // 10)
+
+    def test_compaction_keeps_single_file_and_state(self):
+        window = Window(self.dir, 60, 1000)
+        for i in range(300):
+            window.observe(f"k{i}")
+            window.advance(i)  # exercises sweep segments and expiries
+        self.assertEqual(sorted(os.listdir(self.dir)), ["window.json"])
+        clone = Window(self.dir, 60, 1000)
+        clone.load()
+        self.assertEqual(clone.keys(), window.keys())
+        self.assertEqual(clone.stats(), window.stats())
+
+    def test_v1_document_is_upgraded_on_load(self):
+        self._write_v1([["a", 0], ["b", 0]], admitted=2)
+        window = Window(self.dir, 10, 3)
+        window.load()
+        self.assertEqual(window.keys(), ["a", "b"])
+        self.assertEqual(window.stats()["admitted"], 2)
+
+    def test_v1_document_is_rewritten_as_v2_on_next_commit(self):
+        self._write_v1([["a", 0]], admitted=1)
+        window = Window(self.dir, 10, 3)
+        window.load()
+        window.observe("b")
+        lines = self._lines()
+        self.assertEqual(json.loads(lines[0])["version"], 2)
+        clone = Window(self.dir, 10, 3)
+        clone.load()
+        self.assertEqual(clone.keys(), ["a", "b"])
+        self.assertEqual(clone.stats()["admitted"], 2)
+
+    def test_v1_document_is_rewritten_as_v2_on_save(self):
+        self._write_v1([["a", 0]], admitted=1)
+        window = Window(self.dir, 10, 3)
+        window.load()
+        window.save()
+        self.assertEqual(json.loads(self._lines()[0])["version"], 2)
+
+    def test_missing_version_is_value_error(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"span": 10, "capacity": 3, "now": 0,
+                       "admitted": 0, "expired": 0, "keys": []}, fh)
+        with self.assertRaises(ValueError):
+            Window(self.dir, 10, 3).load()
+
+    def test_unknown_version_is_value_error(self):
+        self._write_v1([])
+        with open(self.path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        doc["version"] = 99
+        canonical = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+        doc["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        with self.assertRaises(ValueError):
+            Window(self.dir, 10, 3).load()
+
+    def test_torn_tail_is_ignored_by_readers(self):
+        window = Window(self.dir, 10, 3)
+        window.observe("a")
+        window.observe("b")
+        with open(self.path, "ab") as fh:
+            fh.write(b'{"kind":"delta","op":"admi')  # interrupted append
+        clone = Window(self.dir, 10, 3)
+        clone.load()  # read-only: restores the last committed state
+        self.assertEqual(clone.keys(), ["a", "b"])
+        self.assertEqual(clone.stats()["admitted"], 2)
+
+    def test_torn_tail_is_repaired_by_the_next_writer(self):
+        window = Window(self.dir, 10, 3)
+        window.observe("a")
+        with open(self.path, "ab") as fh:
+            fh.write(b'{"kind":"delta","op":"admi')
+        window.observe("b")  # must not raise; truncates the torn bytes
+        clone = Window(self.dir, 10, 3)
+        clone.load()
+        self.assertEqual(clone.keys(), ["a", "b"])
+        self.assertEqual(sorted(os.listdir(self.dir)), ["window.json"])
+
+    def test_truncated_base_is_value_error(self):
+        window = Window(self.dir, 10, 3)
+        window.observe("a")
+        raw = self._raw()
+        with open(self.path, "wb") as fh:
+            fh.write(raw[: len(raw) // 2])
+        with self.assertRaises(ValueError):
+            Window(self.dir, 10, 3).load()
+
+    def test_corrupt_middle_segment_is_value_error(self):
+        window = Window(self.dir, 10, 3)
+        for key in "abc":
+            window.observe(key)
+        lines = self._lines()
+        line = lines[1]
+        lines[1] = line[:10] + ("X" if line[10] != "X" else "Y") + line[11:]
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        with self.assertRaises(ValueError):
+            Window(self.dir, 10, 3).load()
 
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

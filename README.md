@@ -26,11 +26,17 @@ Python 3.11 or newer. Standard library only.
 - `stats() -> dict` reports span, capacity, retained, admitted and expired counts.
 - `save() -> None` and `load() -> None` persist the window and re-read it before replacing memory.
 
-State is committed atomically: `save` (and every `observe`/`advance`) writes a checksummed
-temporary file in the state directory and renames it over `window.json`, so a crash, a
-truncated file or external tampering makes `load` raise `ValueError` (or `FileNotFoundError`
-when the file is absent) instead of restoring a partial state. Several local processes may
-share one state directory; a file lock serializes their writes.
+State is committed atomically and incrementally. `window.json` is a log-structured
+document: a checksummed base snapshot followed by small checksummed delta segments, so
+each `observe`/`advance` appends only its own change instead of mirroring the whole
+window, and a compaction periodically merges the segments back into a fresh snapshot
+(written to a temporary file and atomically renamed over `window.json`). A crash, a
+truncated file or external tampering makes `load` raise `ValueError` (or
+`FileNotFoundError` when the file is absent) instead of restoring a partial state; an
+interrupted append only tears the uncommitted tail, which readers ignore and the next
+writer truncates. Documents are versioned: older versions are upgraded on `load` and
+rewritten in the current format on the next commit. Several local processes may share
+one state directory; a file lock serializes their writes.
 
 ## Tests
 
