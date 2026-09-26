@@ -285,7 +285,8 @@ class AtomicCommitTests(unittest.TestCase):
         Window(self.dir, 10, 3).save()
         doc = self._document()
         self.assertIn("checksum", doc)
-        self.assertEqual(doc["version"], 1)
+        self.assertEqual(doc["version"], 2)
+        self.assertEqual(doc["kind"], "base")
         self.assertEqual(len(doc["checksum"]), 64)
 
     def test_missing_integrity_field_is_value_error(self):
@@ -334,6 +335,336 @@ class AtomicCommitTests(unittest.TestCase):
             fh.write("partial")
         window.observe("a")
         self.assertEqual(sorted(os.listdir(self.dir)), ["window.json"])
+
+
+def _signed(body):
+    """Serialize a document body with the checksum the reader expects."""
+    from dedupe_window import window as mod
+
+    data, _ = mod._signed_document(dict(body))
+    return data.decode("utf-8")
+
+
+def _v1_document(span=100000, capacity=100000, now=0,
+                 admitted=0, expired=0, keys=()):
+    return {
+        "version": 1,
+        "span": span,
+        "capacity": capacity,
+        "now": now,
+        "admitted": admitted,
+        "expired": expired,
+        "keys": [list(item) for item in keys],
+    }
+
+
+def _segment_document(seq, base, now, admitted, expired, admit=()):
+    return {
+        "version": 2,
+        "kind": "segment",
+        "seq": seq,
+        "base": base,
+        "now": now,
+        "admitted": admitted,
+        "expired": expired,
+        "admit": [list(item) for item in admit],
+    }
+
+
+class SegmentedSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        from dedupe_window import window as mod
+        self.mod = mod
+        self._saved = (
+            mod._SMALL_STATE_BYTES,
+            mod._COMPACT_SEGMENT_LIMIT,
+            mod._COMPACT_SEGMENT_BYTES,
+            mod._COMPACT_SEGMENT_RATIO,
+        )
+        mod._SMALL_STATE_BYTES = 1024
+        mod._COMPACT_SEGMENT_LIMIT = 64
+        mod._COMPACT_SEGMENT_BYTES = 1 << 30
+        mod._COMPACT_SEGMENT_RATIO = 1 << 30
+
+    def tearDown(self):
+        (
+            self.mod._SMALL_STATE_BYTES,
+            self.mod._COMPACT_SEGMENT_LIMIT,
+            self.mod._COMPACT_SEGMENT_BYTES,
+            self.mod._COMPACT_SEGMENT_RATIO,
+        ) = self._saved
+
+    def _path(self, name="window.json"):
+        return os.path.join(self.dir, name)
+
+    def test_large_state_commits_delta_segments(self):
+        window = Window(self.dir, 100000, 100000)
+        for i in range(40):
+            window.observe(f"key-{i:08d}")
+        names = sorted(os.listdir(self.dir))
+        self.assertEqual(names[0], "window.json")
+        self.assertTrue(
+            any(name.startswith("window.json.seg.") for name in names), names
+        )
+        base_before = os.stat(self._path()).st_mtime_ns
+        clone = Window(self.dir, 100000, 100000)
+        clone.load()
+        self.assertEqual(clone.keys(), [f"key-{i:08d}" for i in range(40)])
+        self.assertEqual(clone.stats()["admitted"], 40)
+        # A single further sighting must not rewrite the base snapshot.
+        window.observe("key-00000040")
+        self.assertEqual(os.stat(self._path()).st_mtime_ns, base_before)
+        clone2 = Window(self.dir, 100000, 100000)
+        clone2.load()
+        self.assertEqual(len(clone2.keys()), 41)
+
+    def test_observe_bytes_are_proportional_to_the_change(self):
+        window = Window(self.dir, 100000, 1_000_000)
+        for i in range(800):
+            window.observe(f"bulk-{i:08d}")
+        window.save()  # compact: one large base file
+        base_size = os.stat(self._path()).st_size
+        self.assertGreater(base_size, 10000)
+        window.observe("one-more-key")
+        names = [n for n in os.listdir(self.dir) if n.startswith("window.json.seg.")]
+        self.assertEqual(len(names), 1)
+        # The commit writes the delta only, not another full mirror.
+        self.assertLess(os.stat(self._path(names[0])).st_size, base_size // 50)
+        clone = Window(self.dir, 100000, 1_000_000)
+        clone.load()
+        self.assertEqual(clone.stats()["retained"], 801)
+        self.assertTrue(clone.seen("one-more-key"))
+
+    def test_save_compacts_segments_into_one_file(self):
+        window = Window(self.dir, 100000, 100000)
+        for i in range(40):
+            window.observe(f"key-{i:08d}")
+        self.assertGreater(len(os.listdir(self.dir)), 1)
+        window.save()
+        self.assertEqual(os.listdir(self.dir), ["window.json"])
+        with open(self._path()) as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["version"], 2)
+        self.assertEqual(doc["kind"], "base")
+        self.assertEqual(doc["seq"], doc["seq"])
+        clone = Window(self.dir, 100000, 100000)
+        clone.load()
+        self.assertEqual(clone.keys(), [f"key-{i:08d}" for i in range(40)])
+        self.assertEqual(clone.stats(), window.stats())
+
+    def test_automatic_compaction_after_segment_limit(self):
+        self.mod._COMPACT_SEGMENT_LIMIT = 3
+        window = Window(self.dir, 100000, 100000)
+        compacted_at_least_once = False
+        for i in range(20):
+            window.observe(f"key-{i:08d}")
+            if os.listdir(self.dir) == ["window.json"] and i > 5:
+                compacted_at_least_once = True
+        self.assertTrue(compacted_at_least_once)
+        clone = Window(self.dir, 100000, 100000)
+        clone.load()
+        self.assertEqual(len(clone.keys()), 20)
+        self.assertEqual(clone.stats()["admitted"], 20)
+
+    def test_expiry_replays_through_segments(self):
+        window = Window(self.dir, 10, 100000)
+        for i in range(40):
+            window.observe(f"key-{i:08d}")
+        self.assertEqual(window.advance(11), 40)
+        clone = Window(self.dir, 10, 100000)
+        clone.load()
+        self.assertEqual(clone.keys(), [])
+        self.assertEqual(clone.stats()["admitted"], 40)
+        self.assertEqual(clone.stats()["expired"], 40)
+        window.save()
+        clone2 = Window(self.dir, 10, 100000)
+        clone2.load()
+        self.assertEqual(clone2.stats(), window.stats())
+
+    def test_capacity_eviction_replays_through_segments(self):
+        window = Window(self.dir, 100000, 30)
+        for i in range(40):
+            window.observe(f"key-{i:08d}")
+        clone = Window(self.dir, 100000, 30)
+        clone.load()
+        self.assertEqual(len(clone.keys()), 30)
+        self.assertEqual(clone.keys()[0], "key-00000010")
+        self.assertEqual(clone.stats()["admitted"], 40)
+        self.assertEqual(clone.stats()["expired"], 0)
+
+    def test_v1_document_is_loaded_and_upgraded_on_next_commit(self):
+        body = _v1_document(
+            now=4, admitted=2, expired=0,
+            keys=[["a", 0], ["b", 4]],
+        )
+        with open(self._path(), "w", encoding="utf-8") as fh:
+            fh.write(_signed(body))
+        window = Window(self.dir, 100000, 100000)
+        window.load()  # old version reads transparently
+        self.assertEqual(window.keys(), ["a", "b"])
+        self.assertEqual(window.stats()["admitted"], 2)
+        window.observe("c")  # upgrade is written with the next commit
+        with open(self._path()) as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["version"], 2)
+        self.assertEqual(doc["kind"], "base")
+        self.assertEqual(os.listdir(self.dir), ["window.json"])
+        clone = Window(self.dir, 100000, 100000)
+        clone.load()
+        self.assertEqual(clone.keys(), ["a", "b", "c"])
+
+    def test_v1_document_is_upgraded_by_save(self):
+        with open(self._path(), "w", encoding="utf-8") as fh:
+            fh.write(_signed(_v1_document()))
+        window = Window(self.dir, 100000, 100000)
+        window.load()
+        window.save()
+        with open(self._path()) as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["version"], 2)
+
+    def test_missing_version_is_value_error(self):
+        body = _v1_document()
+        del body["version"]
+        with open(self._path(), "w", encoding="utf-8") as fh:
+            fh.write(_signed(body))
+        with self.assertRaises(ValueError):
+            Window(self.dir, 100000, 100000).load()
+
+    def test_unknown_version_is_value_error(self):
+        body = _v1_document()
+        body["version"] = 99
+        with open(self._path(), "w", encoding="utf-8") as fh:
+            fh.write(_signed(body))
+        with self.assertRaises(ValueError) as cm:
+            Window(self.dir, 100000, 100000).load()
+        self.assertIn("unsupported version", str(cm.exception))
+
+    def test_segment_with_foreign_base_is_value_error(self):
+        window = Window(self.dir, 100000, 100000)
+        for i in range(30):
+            window.observe(f"key-{i:08d}")
+        name = "window.json.seg.999"
+        seg = _segment_document(999, "0" * 64, 0, 0, 0)
+        with open(self._path(name), "w", encoding="utf-8") as fh:
+            fh.write(_signed(seg))
+        with self.assertRaises(ValueError) as cm:
+            Window(self.dir, 100000, 100000).load()
+        self.assertIn("does not belong", str(cm.exception))
+
+    def test_gap_in_segment_chain_is_value_error(self):
+        window = Window(self.dir, 100000, 100000)
+        for i in range(30):
+            window.observe(f"key-{i:08d}")
+        with open(self._path()) as fh:
+            base = json.load(fh)
+        gap_seq = base["seq"] + 50
+        seg = _segment_document(
+            gap_seq, base["checksum"], 0, 0, 0
+        )
+        with open(self._path(f"window.json.seg.{gap_seq}"), "w") as fh:
+            fh.write(_signed(seg))
+        with self.assertRaises(ValueError) as cm:
+            Window(self.dir, 100000, 100000).load()
+        self.assertIn("missing a segment", str(cm.exception))
+
+    def test_tampered_segment_is_value_error(self):
+        window = Window(self.dir, 100000, 100000)
+        for i in range(30):
+            window.observe(f"key-{i:08d}")
+        seg_names = sorted(
+            n for n in os.listdir(self.dir) if n.startswith("window.json.seg.")
+        )
+        path = self._path(seg_names[0])
+        with open(path, encoding="utf-8") as fh:
+            seg = json.load(fh)
+        seg["admitted"] = 999
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(seg, fh)
+        with self.assertRaises(ValueError):
+            Window(self.dir, 100000, 100000).load()
+
+    def test_truncated_segment_is_value_error(self):
+        window = Window(self.dir, 100000, 100000)
+        for i in range(30):
+            window.observe(f"key-{i:08d}")
+        seg_names = sorted(
+            n for n in os.listdir(self.dir) if n.startswith("window.json.seg.")
+        )
+        path = self._path(seg_names[0])
+        os.truncate(path, os.path.getsize(path) // 2)
+        with self.assertRaises(ValueError):
+            Window(self.dir, 100000, 100000).load()
+
+    def test_stale_segment_after_interrupted_compaction_is_ignored(self):
+        window = Window(self.dir, 100000, 100000)
+        for i in range(40):
+            window.observe(f"key-{i:08d}")
+        window.save()  # base seq > 0, segments removed
+        with open(self._path()) as fh:
+            doc = json.load(fh)
+        stale = _segment_document(1, "deadbeef" * 8, 0, 0, 0)
+        with open(self._path("window.json.seg.1"), "w", encoding="utf-8") as fh:
+            fh.write(_signed(stale))
+        clone = Window(self.dir, 100000, 100000)
+        clone.load()  # must not confuse the stale segment with live state
+        self.assertEqual(len(clone.keys()), 40)
+        clone.observe("key-00000040")
+        self.assertFalse(
+            os.path.exists(self._path("window.json.seg.1"))
+        )
+
+    def test_v1_base_with_segment_is_half_migration_error(self):
+        body = _v1_document()
+        text = _signed(body)
+        with open(self._path(), "w", encoding="utf-8") as fh:
+            fh.write(text)
+        base_checksum = json.loads(text)["checksum"]
+        seg = _segment_document(1, base_checksum, 0, 0, 0)
+        with open(self._path("window.json.seg.1"), "w", encoding="utf-8") as fh:
+            fh.write(_signed(seg))
+        with self.assertRaises(ValueError) as cm:
+            Window(self.dir, 100000, 100000).load()
+        self.assertIn("half migrated", str(cm.exception))
+
+    def test_no_residue_after_many_transactions(self):
+        window = Window(self.dir, 100000, 100000)
+        for i in range(40):
+            window.observe(f"key-{i:08d}")
+        window.advance(5)
+        window.save()
+        for name in os.listdir(self.dir):
+            self.assertFalse(name.endswith(".tmp"))
+        self.assertEqual(os.listdir(self.dir), ["window.json"])
+
+    def test_concurrent_observers_roundtrip_and_compact(self):
+        script = textwrap.dedent("""
+            import sys
+            from dedupe_window import Window
+            idx, state, n = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+            w = Window(state, 100000, 1000000)
+            for i in range(idx * n, idx * n + n):
+                w.observe(f"k{i:08d}")
+        """)
+        env = dict(
+            os.environ,
+            PYTHONPATH=_REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""),
+        )
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(i), self.dir, "25"],
+                env=env,
+            )
+            for i in range(8)
+        ]
+        self.assertEqual([p.wait() for p in procs], [0] * 8)
+        clone = Window(self.dir, 100000, 1000000)
+        clone.load()
+        self.assertEqual(clone.stats()["admitted"], 200)
+        self.assertEqual(len(clone.keys()), 200)
+        clone.save()
+        self.assertEqual(os.listdir(self.dir), ["window.json"])
 
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
