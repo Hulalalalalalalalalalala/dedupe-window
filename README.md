@@ -26,12 +26,18 @@ Python 3.11 or newer. Standard library only.
 - `stats() -> dict` reports span, capacity, retained, admitted and expired counts.
 - `save() -> None` and `load() -> None` persist the window and re-read it before replacing memory.
 
+State is committed atomically: `save` (and every `observe`/`advance`) writes a checksummed
+temporary file in the state directory and renames it over `window.json`, so a crash, a
+truncated file or external tampering makes `load` raise `ValueError` (or `FileNotFoundError`
+when the file is absent) instead of restoring a partial state. Several local processes may
+share one state directory; a file lock serializes their writes.
+
 ## Tests
 
     python3 -m unittest discover -s tests -t .
 
 ## Limits
 
-Single process; no cross-process locking.
+Multiple local processes coordinate with a file lock; there is no network or remote support.
 Keys are text; no value is stored with them.
 Span and capacity are the only eviction rules.

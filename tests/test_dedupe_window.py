@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 import unittest
 
 from dedupe_window import Window
@@ -229,6 +231,245 @@ class CliTests(unittest.TestCase):
         result = self.run_cli("--state", state, "stats")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+
+    def _corrupt_file(self, state, content):
+        os.makedirs(state, exist_ok=True)
+        with open(os.path.join(state, "window.json"), "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+    def test_cli_distinguishes_corruption_reasons(self):
+        cases = [
+            ("{broken", "not valid JSON"),
+            (json.dumps({"version": 1, "span": 60, "capacity": 1024,
+                         "now": 0, "admitted": 0, "expired": 0, "keys": []}),
+             "missing integrity information"),
+            (json.dumps({"version": 1, "span": 60, "capacity": 1024, "now": 0,
+                         "admitted": 0, "expired": 0, "keys": [],
+                         "checksum": "0" * 64}),
+             "checksum"),
+        ]
+        for content, fragment in cases:
+            state = os.path.join(self.dir, "w_" + str(len(fragment)))
+            self._corrupt_file(state, content)
+            result = self.run_cli("--state", state, "stats")
+            self.assertEqual(result.returncode, 1, content)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+            self.assertIn(fragment, result.stderr)
+
+    def test_cli_missing_file_for_observe_starts_empty(self):
+        state = os.path.join(self.dir, "fresh")
+        result = self.run_cli("--state", state, "observe", "a")
+        self.assertEqual((result.returncode, result.stdout), (0, "true\n"))
+        again = self.run_cli("--state", state, "observe", "a")
+        self.assertEqual((again.returncode, again.stdout), (0, "false\n"))
+
+
+class AtomicCommitTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def _document(self):
+        with open(os.path.join(self.dir, "window.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_only_data_file_remains_after_saves(self):
+        window = Window(self.dir, 10, 3)
+        for key in "abcdef":
+            window.observe(key)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["window.json"])
+        window.save()
+        window.save()
+        self.assertEqual(sorted(os.listdir(self.dir)), ["window.json"])
+
+    def test_document_carries_checksum_and_version(self):
+        Window(self.dir, 10, 3).save()
+        doc = self._document()
+        self.assertIn("checksum", doc)
+        self.assertEqual(doc["version"], 1)
+        self.assertEqual(len(doc["checksum"]), 64)
+
+    def test_missing_integrity_field_is_value_error(self):
+        path = os.path.join(self.dir, "window.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "span": 10, "capacity": 3, "now": 0,
+                       "admitted": 0, "expired": 0, "keys": []}, fh)
+        with self.assertRaises(ValueError) as cm:
+            Window(self.dir, 10, 3).load()
+        self.assertIn("missing integrity information", str(cm.exception))
+
+    def test_checksum_mismatch_is_value_error(self):
+        Window(self.dir, 10, 3).save()
+        path = os.path.join(self.dir, "window.json")
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        doc["admitted"] = 1  # alter payload without recomputing the checksum
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        with self.assertRaises(ValueError) as cm:
+            Window(self.dir, 10, 3).load()
+        self.assertIn("checksum does not match", str(cm.exception))
+
+    def test_non_ascii_checksum_does_not_raise_type_error(self):
+        with open(os.path.join(self.dir, "window.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"version":1,"span":10,"capacity":3,"now":0,'
+                     '"admitted":0,"expired":0,"keys":[],"checksum":"é"}')
+        with self.assertRaises(ValueError):
+            Window(self.dir, 10, 3).load()
+
+    def test_roundtrip_preserves_order_counts_and_now(self):
+        window = Window(self.dir, 10, 3)
+        window.observe("a")
+        window.advance(4)
+        window.observe("b")
+        window.observe("c")
+        window.save()
+        clone = Window(self.dir, 10, 3)
+        clone.load()
+        self.assertEqual(clone.keys(), ["a", "b", "c"])
+        self.assertEqual(clone.stats(), window.stats())
+
+    def test_stale_temp_file_from_dead_writer_is_swept(self):
+        window = Window(self.dir, 10, 3)
+        with open(os.path.join(self.dir, "window.json.deadbeef.tmp"), "w") as fh:
+            fh.write("partial")
+        window.observe("a")
+        self.assertEqual(sorted(os.listdir(self.dir)), ["window.json"])
+
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _worker(script):
+    return textwrap.dedent(script).strip()
+
+
+class MultiProcessTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def _run_workers(self, script, count, *args):
+        env = dict(os.environ, PYTHONPATH=_REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(i), self.dir, *map(str, args)],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for i in range(count)
+        ]
+        results = [p.communicate() for p in procs]
+        return procs, results
+
+    def test_concurrent_observers_match_serial_counts(self):
+        script = _worker("""
+            import sys
+            from dedupe_window import Window
+            idx, state, n = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+            w = Window(state, 100000, 10000)
+            for i in range(idx * n, idx * n + n):
+                w.observe(f"k{i}")
+        """)
+        n_workers, per_worker = 8, 25
+        procs, _ = self._run_workers(script, n_workers, per_worker)
+        self.assertEqual([p.returncode for p in procs], [0] * n_workers)
+        window = Window(self.dir, 100000, 10000)
+        window.load()
+        stats = window.stats()
+        self.assertEqual(stats["admitted"], n_workers * per_worker)
+        self.assertEqual(stats["retained"], n_workers * per_worker)
+        self.assertEqual(stats["expired"], 0)
+        self.assertEqual(len(window.keys()), len(set(window.keys())))
+        self.assertEqual(sorted(os.listdir(self.dir)), ["window.json"])
+
+    def test_duplicate_across_processes_is_admitted_once(self):
+        script = _worker("""
+            import sys
+            from dedupe_window import Window
+            _, state = sys.argv[1], sys.argv[2]
+            w = Window(state, 100000, 100)
+            for _ in range(4):
+                w.observe("shared")
+        """)
+        procs, _ = self._run_workers(script, 10)
+        self.assertEqual([p.returncode for p in procs], [0] * 10)
+        window = Window(self.dir, 100000, 100)
+        window.load()
+        self.assertEqual(window.stats()["admitted"], 1)
+        self.assertTrue(window.seen("shared"))
+
+    def test_capacity_under_contention(self):
+        script = _worker("""
+            import sys
+            from dedupe_window import Window
+            idx, state, n, cap = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+            w = Window(state, 100000, cap)
+            for i in range(idx * n, idx * n + n):
+                w.observe(f"k{i}")
+        """)
+        cap = 30
+        procs, _ = self._run_workers(script, 8, 25, cap)
+        self.assertEqual([p.returncode for p in procs], [0] * 8)
+        window = Window(self.dir, 100000, cap)
+        window.load()
+        stats = window.stats()
+        self.assertEqual(stats["retained"], cap)
+        self.assertEqual(stats["admitted"], 8 * 25)
+
+    def test_interleaved_advance_keeps_window_consistent(self):
+        # Three advancers drive the same monotone clock; none may raise merely
+        # because a peer committed a newer time.
+        script = _worker("""
+            import sys, time
+            from dedupe_window import Window
+            _, state = sys.argv[1], sys.argv[2]
+            w = Window(state, 10, 100)
+            for t in (5, 12, 20, 35):
+                w.advance(t)
+                time.sleep(0.005)
+        """)
+        procs, _ = self._run_workers(script, 3)
+        self.assertEqual([p.returncode for p in procs], [0, 0, 0])
+        window = Window(self.dir, 10, 100)
+        window.load()
+        stats = window.stats()
+        self.assertEqual(stats["admitted"], stats["retained"] + stats["expired"])
+
+    def test_killed_lock_holder_does_not_deadlock(self):
+        script = _worker("""
+            import os, sys
+            from dedupe_window import Window
+            _, state = sys.argv[1], sys.argv[2]
+            w = Window(state, 10, 3)
+            with w._locked(True):
+                os.kill(os.getpid(), 9)
+        """)
+        env = dict(os.environ, PYTHONPATH=_REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
+        victim = subprocess.Popen([sys.executable, "-c", script, "0", self.dir], env=env)
+        victim.communicate()
+        self.assertLess(victim.returncode, 0)
+        window = Window(self.dir, 10, 3)
+        window.observe("after-kill")  # must not block forever or raise
+        self.assertTrue(window.seen("after-kill"))
+
+    def test_waiter_blocks_until_lock_released(self):
+        script = _worker("""
+            import sys, time
+            from dedupe_window import Window
+            _, state, hold = sys.argv[1], sys.argv[2], float(sys.argv[3])
+            w = Window(state, 10, 3)
+            with w._locked(True):
+                time.sleep(hold)
+        """)
+        env = dict(os.environ, PYTHONPATH=_REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
+        holder = subprocess.Popen([sys.executable, "-c", script, "0", self.dir, "1.5"], env=env)
+        time.sleep(0.3)
+        try:
+            window = Window(self.dir, 10, 3)
+            started = time.monotonic()
+            window.observe("late")
+            self.assertGreaterEqual(time.monotonic() - started, 0.9)
+            Window(self.dir, 10, 3).load()
+        finally:
+            holder.communicate()
 
 
 if __name__ == "__main__":

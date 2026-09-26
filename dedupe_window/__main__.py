@@ -6,7 +6,7 @@ import json
 import os
 import sys
 
-from .window import Window
+from .window import Window, read_settings
 
 DEFAULT_SPAN = 60
 DEFAULT_CAPACITY = 1024
@@ -59,17 +59,18 @@ def _parse(argv):
 
 
 def _open_window(state):
-    """Load the persisted window, or start an empty one with the defaults."""
+    """Load the persisted window, or start an empty one with the defaults.
+
+    A missing data file means a fresh window (only possible for the first
+    observe); every other read failure is corruption and exits 1.
+    """
     path = os.path.join(state, "window.json")
     span, capacity = DEFAULT_SPAN, DEFAULT_CAPACITY
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                settings = json.load(fh)
-            span = settings["span"]
-            capacity = settings["capacity"]
-        except Exception:
-            _corrupt("cannot read span and capacity")
+            span, capacity = read_settings(path)
+        except ValueError as exc:
+            _corrupt(str(exc))
     try:
         window = Window(state, span, capacity)
     except (TypeError, ValueError) as exc:
@@ -77,6 +78,8 @@ def _open_window(state):
     if os.path.exists(path):
         try:
             window.load()
+        except FileNotFoundError:
+            pass  # another process removed it between the checks above
         except ValueError as exc:
             _corrupt(str(exc))
     return window
@@ -84,15 +87,36 @@ def _open_window(state):
 
 def main(argv=None):
     state, command, operands = _parse(list(sys.argv[1:] if argv is None else argv))
-    os.makedirs(state, exist_ok=True)
-    window = _open_window(state)
+    path = os.path.join(state, "window.json")
     if command == "observe":
-        result = window.observe(operands[0])
-        window.save()
+        os.makedirs(state, exist_ok=True)
+        window = _open_window(state)
+        result = window.observe(operands[0])  # one locked, durable transaction
         print(json.dumps(result))
     elif command == "seen":
+        # Pure read: never create the directory, never touch the data file.
+        if not os.path.exists(path):
+            print(json.dumps(False))
+            return 0
+        window = _open_window(state)
         print(json.dumps(window.seen(operands[0])))
     else:
+        # Pure read: never create the directory, never touch the data file.
+        if not os.path.exists(path):
+            print(
+                json.dumps(
+                    {
+                        "span": DEFAULT_SPAN,
+                        "capacity": DEFAULT_CAPACITY,
+                        "retained": 0,
+                        "admitted": 0,
+                        "expired": 0,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            return 0
+        window = _open_window(state)
         print(json.dumps(window.stats(), separators=(",", ":")))
     return 0
 
