@@ -31,12 +31,30 @@ upgraded in memory and rewritten in the current format on the next commit.
 A document without a version, with an unknown version, or left in a
 half-migrated shape raises ``ValueError``.
 
+Every mutation commits as a numbered point, starting at 1.  Compaction and
+``save`` rewrites only re-persist existing points: they neither create new
+numbers nor change old ones, and a crash-interrupted write leaves no
+addressable point behind.  :meth:`Window.export` writes the complete window
+at one still-available committed point (the latest by default) as a
+self-contained, versioned and checksummed JSON document;
+:meth:`Window.restore` reads such a document back, replaces the key order,
+current time and counts with it and lands the result as the next commit
+point.  Points merged away by compaction are no longer addressable; asking
+for one raises ``ValueError``.
+
 Multiple processes may work the same state directory.  Mutual exclusion uses
 an advisory ``flock`` on a file descriptor opened on the state directory
 itself, so no lock file is ever left behind and the kernel releases the lock
 if a process dies while holding it.  Mutating operations are linearizable:
 each runs as lock -> reload -> mutate -> atomic commit, equivalent to some
-serial execution in arrival order.  Local deployment only; no networking.
+serial execution in arrival order.  Readers take no lock at all and never
+block a writer: committed bytes are never rewritten in place (appends only
+extend the tail, compaction renames a complete temporary file over the data
+file) and the parser ignores a torn uncommitted tail, so a read always sees
+exactly one complete commit -- never a torn tail, never a compaction
+intermediate, never a mix of old and new.  Opening a window does not create
+its state directory; the directory appears on the first commit.  Local
+deployment only; no networking.
 """
 
 from __future__ import annotations
@@ -53,6 +71,8 @@ _STATE_FILE = "window.json"
 _TMP_PREFIX = _STATE_FILE + "."
 _TMP_SUFFIX = ".tmp"
 _VERSION = 2
+_EXPORT_VERSION = 1
+_EXPORT_KIND = "export"
 _REQUIRED_FIELDS = (
     "version",
     "span",
@@ -339,12 +359,14 @@ def _apply_segment(line, *, span, capacity, now, admitted, expired, seq, tip,
     return new_now, new_admitted, new_expired, seg_seq, document["checksum"], max_first
 
 
-def _parse_v2_log(text):
+def _parse_v2_log(text, stop_seq=None):
     """Parse a log-structured version 2 file: base line plus delta lines.
 
     Only the final line may be torn (an interrupted append); it is ignored
     and its offset recorded so the next writer can truncate it.  Any other
-    inconsistency is corruption and raises ValueError.
+    inconsistency is corruption and raises ValueError.  With ``stop_seq``
+    the replay halts at that commit point; a point the file no longer holds
+    (newer than the tip, or merged away by compaction) raises ValueError.
     """
     lines = text.split("\n")
     if lines and lines[-1] == "":
@@ -367,30 +389,35 @@ def _parse_v2_log(text):
     good_offset = base_bytes
     segment_bytes = 0
     segment_count = 0
-    last = len(lines) - 1
-    for i in range(1, len(lines)):
-        line_len = len(lines[i].encode("utf-8")) + 1
-        try:
-            now, admitted, expired, seq, tip, max_first = _apply_segment(
-                lines[i],
-                span=span,
-                capacity=capacity,
-                now=now,
-                admitted=admitted,
-                expired=expired,
-                seq=seq,
-                tip=tip,
-                entries=entries,
-                index=index,
-                max_first=max_first,
-            )
-        except ValueError:
-            if i == last:
-                break  # torn tail of an interrupted append: ignore it
-            raise
-        good_offset += line_len
-        segment_bytes += line_len
-        segment_count += 1
+    if stop_seq is None or seq != stop_seq:
+        last = len(lines) - 1
+        for i in range(1, len(lines)):
+            line_len = len(lines[i].encode("utf-8")) + 1
+            try:
+                now, admitted, expired, seq, tip, max_first = _apply_segment(
+                    lines[i],
+                    span=span,
+                    capacity=capacity,
+                    now=now,
+                    admitted=admitted,
+                    expired=expired,
+                    seq=seq,
+                    tip=tip,
+                    entries=entries,
+                    index=index,
+                    max_first=max_first,
+                )
+            except ValueError:
+                if i == last:
+                    break  # torn tail of an interrupted append: ignore it
+                raise
+            good_offset += line_len
+            segment_bytes += line_len
+            segment_count += 1
+            if stop_seq is not None and seq == stop_seq:
+                break
+    if stop_seq is not None and seq != stop_seq:
+        raise ValueError(f"state file holds no commit point {stop_seq}")
     return _ParsedState(
         version=2,
         span=span,
@@ -408,14 +435,16 @@ def _parse_v2_log(text):
     )
 
 
-def _parse_state_file(path):
+def _parse_state_file(path, stop_seq=None):
     """Read, verify and replay the state file at ``path``.
 
     Raises FileNotFoundError when the file is absent and ValueError for
     every form of corruption: bad formatting, a missing or unknown version,
     a missing or mismatched checksum, a broken segment chain or state that
     violates the window invariants.  A torn final segment left by a crashed
-    writer is not corruption; it is ignored and its offset reported.
+    writer is not corruption; it is ignored and its offset reported.  With
+    ``stop_seq`` the state is replayed only up to that commit point; a
+    point the file does not hold raises ValueError.
     """
     try:
         with open(path, "rb") as fh:
@@ -439,11 +468,52 @@ def _parse_state_file(path):
             raise ValueError("state file must contain a JSON object")
         version = _version_of(document)
         if version == 1:
-            return _parse_v1(document, len(raw))
-        if version == 2:
-            return _parse_v2_single(document, len(raw))
-        raise ValueError("state file has an unsupported version")
-    return _parse_v2_log(text)
+            parsed = _parse_v1(document, len(raw))
+        elif version == 2:
+            parsed = _parse_v2_single(document, len(raw))
+        else:
+            raise ValueError("state file has an unsupported version")
+        if stop_seq is not None and parsed.seq != stop_seq:
+            raise ValueError(f"state file holds no commit point {stop_seq}")
+        return parsed
+    return _parse_v2_log(text, stop_seq)
+
+
+def _parse_export_file(path):
+    """Read, verify and validate an export document; return its snapshot.
+
+    Raises FileNotFoundError when the file is absent and ValueError for a
+    missing or unknown version, a missing or mismatched checksum, external
+    tampering or any other malformation.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"export file cannot be read: {exc}") from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"export file is not valid UTF-8: {exc}") from exc
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"export file is not valid JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError("export file must contain a JSON object")
+    if "version" not in document:
+        raise ValueError("export file is missing a version number")
+    version = document["version"]
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ValueError("export file has an invalid version")
+    if version != _EXPORT_VERSION:
+        raise ValueError("export file has an unsupported version")
+    if document.get("kind") != _EXPORT_KIND:
+        raise ValueError("export file is not an export document")
+    body = _verified_body(document, "export file")
+    return _validate_snapshot(body)
 
 
 def read_settings(path):
@@ -486,7 +556,8 @@ class Window:
         self._segment_bytes = 0
         self._segment_count = 0
         self._good_offset = 0  # end of the committed prefix of the data file
-        os.makedirs(self._state_dir, exist_ok=True)
+        # Opening a window creates nothing; the state directory appears on
+        # the first commit.
 
     @contextlib.contextmanager
     def _locked(self, exclusive):
@@ -509,6 +580,7 @@ class Window:
         serialized as if their calls ran one after another.
         """
         _check_key(key)
+        os.makedirs(self._state_dir, exist_ok=True)
         with self._locked(True):
             self._reload_if_present()
             admitted, evicted = self._admit(key)
@@ -542,6 +614,7 @@ class Window:
         """
         if not _is_number(now):
             raise TypeError("now must be an int or float")
+        os.makedirs(self._state_dir, exist_ok=True)
         with self._locked(True):
             # Monotonicity is per process: this call must not go back past a
             # time this same process already loaded or requested.
@@ -605,21 +678,98 @@ class Window:
                     return
                 if parsed.version == _VERSION:
                     return  # already durable in the current format
-            self._commit_base()
+            self._commit_base(self._seq)  # re-persist, not a new point
 
     def load(self):
         """Re-read the state file and replace memory only once it checks out.
 
-        Older document versions are upgraded in memory; the next commit
-        rewrites them in the current format.
+        The read takes no lock and never blocks a writer: committed bytes
+        are never rewritten in place, so whatever is read -- with any torn
+        uncommitted tail ignored -- is exactly one complete commit.  Older
+        document versions are upgraded in memory; the next commit rewrites
+        them in the current format.
         """
         path = os.path.join(self._state_dir, _STATE_FILE)
-        with self._locked(False):
-            parsed = _parse_state_file(path)  # FileNotFoundError if absent
-            self._adopt(parsed)
-            self._file_present = True
-            self._file_stamp = _stamp_of(path)
+        # Stamp before reading: if a writer commits in between, the recorded
+        # stamp is too old, which only costs a harmless extra reload later.
+        stamp = _stamp_of(path)  # FileNotFoundError if absent
+        parsed = _parse_state_file(path)
+        self._adopt(parsed)
+        self._file_present = True
+        self._file_stamp = stamp
         self._clock = self._now
+
+    def export(self, seq=None, path=None):
+        """Write the complete window at one committed point to ``path``.
+
+        ``seq`` selects the commit point; the latest committed point is used
+        when it is omitted.  For convenience the arguments may also be given
+        as ``export(path)`` or ``export(path, seq)``.  A ``seq`` that is not
+        a positive integer raises TypeError; one the state no longer holds
+        (beyond the latest point, or merged away by compaction) raises
+        ValueError.  The document is self-contained -- version, snapshot and
+        integrity checksum -- with fixed key order, compact whitespace and a
+        trailing newline, so exporting the same point again always yields
+        the same bytes.  A missing state file or a missing parent directory
+        of ``path`` raises FileNotFoundError.  Returns the point's number.
+        """
+        if isinstance(seq, (str, os.PathLike)) and (
+            path is None or isinstance(path, int)
+        ):
+            seq, path = path, seq
+        if path is None:
+            raise TypeError("export requires a destination path")
+        if seq is not None and (
+            not isinstance(seq, int) or isinstance(seq, bool) or seq <= 0
+        ):
+            raise TypeError("commit sequence number must be a positive integer")
+        parsed = _parse_state_file(
+            os.path.join(self._state_dir, _STATE_FILE), stop_seq=seq
+        )
+        body = {
+            "version": _EXPORT_VERSION,
+            "kind": _EXPORT_KIND,
+            "span": parsed.span,
+            "capacity": parsed.capacity,
+            "now": parsed.now,
+            "admitted": parsed.admitted,
+            "expired": parsed.expired,
+            "keys": [[key, first] for key, first in parsed.entries],
+        }
+        envelope = dict(body)
+        envelope["checksum"] = _checksum(body)
+        data = (
+            json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        with open(os.fspath(path), "wb") as fh:
+            fh.write(data)
+        return parsed.seq
+
+    def restore(self, path):
+        """Replace the window with the point held in an export document.
+
+        The document's key order, current time and both counts are adopted
+        and committed as the next commit point; the window's span and
+        capacity must match the document's.  A missing export file raises
+        FileNotFoundError; a missing or unknown version, a checksum
+        mismatch, tampering or any other malformation raises ValueError.
+        Returns the sequence number of the new commit.
+        """
+        span, capacity, now, admitted, expired, entries = _parse_export_file(path)
+        if span != self._span or capacity != self._capacity:
+            raise ValueError("export file settings do not match this window")
+        os.makedirs(self._state_dir, exist_ok=True)
+        with self._locked(True):
+            self._sweep_temp_files()
+            self._reload_if_present()
+            self._now = now
+            self._admitted = admitted
+            self._expired = expired
+            self._entries = [list(pair) for pair in entries]
+            self._index = {key: first for key, first in self._entries}
+            self._commit_base(self._seq + 1)  # the restore is the next point
+        self._clock = self._now
+        return self._seq
 
     def _reload_if_present(self):
         """Adopt the latest committed state; a missing file starts from empty."""
@@ -681,18 +831,24 @@ class Window:
         return self._segment_bytes >= max(_MIN_BASE_BYTES, self._base_bytes)
 
     def _commit_state(self, op=None, drop=(), add=()):
-        """Commit the in-memory state; caller holds the write lock."""
+        """Commit the in-memory state; caller holds the write lock.
+
+        A mutation (``op`` given) is the next numbered commit point, whether
+        it lands as an appended segment or as a rewritten base snapshot; a
+        plain re-persist (``save``, compaction) keeps the current number.
+        """
         self._sweep_temp_files()
+        seq = self._seq + 1 if op is not None else self._seq
         if op is None or self._needs_base_write():
-            self._commit_base()
+            self._commit_base(seq)
             return
         try:
-            self._append_segment(op, drop, add)
+            self._append_segment(seq, op, drop, add)
         except FileNotFoundError:
             # The data file vanished from under us; rewrite it wholesale.
-            self._commit_base()
+            self._commit_base(seq)
 
-    def _commit_base(self):
+    def _commit_base(self, seq):
         """Write a full snapshot via temp + fsync + atomic rename."""
         path = os.path.join(self._state_dir, _STATE_FILE)
         body = {
@@ -703,7 +859,7 @@ class Window:
             "now": self._now,
             "admitted": self._admitted,
             "expired": self._expired,
-            "seq": self._seq,
+            "seq": seq,
             "keys": [[key, first] for key, first in self._entries],
         }
         checksum = _checksum(body)
@@ -736,6 +892,7 @@ class Window:
                 except OSError:
                     pass
         self._last_commit = checksum
+        self._seq = seq
         self._loaded_version = _VERSION
         self._file_present = True
         self._base_bytes = len(data)
@@ -744,7 +901,7 @@ class Window:
         self._good_offset = len(data)
         self._file_stamp = _stamp_of(path)
 
-    def _append_segment(self, op, drop, add):
+    def _append_segment(self, seq, op, drop, add):
         """Commit one mutation by appending a small segment in place.
 
         Only the tail of the data file is written, so the bytes hitting disk
@@ -756,7 +913,7 @@ class Window:
         body = {
             "kind": "delta",
             "op": op,
-            "seq": self._seq + 1,
+            "seq": seq,
             "prev": self._last_commit,
             "now": self._now,
             "admitted": self._admitted,
@@ -781,7 +938,7 @@ class Window:
             os.fsync(fd)
         finally:
             os.close(fd)
-        self._seq += 1
+        self._seq = seq
         self._last_commit = checksum
         self._segment_bytes += len(data)
         self._segment_count += 1

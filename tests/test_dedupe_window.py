@@ -5,10 +5,12 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 
 from dedupe_window import Window
+import dedupe_window.window as window_module
 
 
 class WindowBehaviourTests(unittest.TestCase):
@@ -497,9 +499,301 @@ class SegmentedStateTests(unittest.TestCase):
             Window(self.dir, 10, 3).load()
 
 
+class CommitPointTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.state = os.path.join(self.dir, "window")
+
+    def _window(self, span=10, capacity=3):
+        return Window(self.state, span, capacity)
+
+    def _export_doc(self, body):
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        envelope = dict(body)
+        envelope["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n"
+
+    def test_opening_does_not_create_state_dir(self):
+        missing = os.path.join(self.dir, "fresh")
+        Window(missing, 10, 3)
+        self.assertFalse(os.path.exists(missing))
+
+    def test_commit_points_start_at_one(self):
+        window = self._window()
+        window.observe("a")
+        self.assertEqual(window.export(None, os.path.join(self.dir, "one.json")), 1)
+        window.observe("b")
+        self.assertEqual(window.export(None, os.path.join(self.dir, "two.json")), 2)
+
+    def test_export_writes_compact_self_contained_document(self):
+        window = self._window()
+        window.observe("a")
+        window.advance(4)
+        window.observe("b")
+        target = os.path.join(self.dir, "doc.json")
+        window.export(None, target)
+        with open(target, "rb") as fh:
+            raw = fh.read()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertNotIn(b" ", raw)
+        doc = json.loads(raw)
+        self.assertEqual(list(doc), sorted(doc))  # fixed key order
+        self.assertEqual(doc["version"], 1)
+        self.assertEqual(doc["kind"], "export")
+        self.assertEqual(doc["keys"], [["a", 0], ["b", 4]])
+        self.assertEqual(doc["now"], 4)
+        self.assertEqual(doc["admitted"], 2)
+        self.assertEqual(doc["expired"], 0)
+        self.assertEqual(len(doc["checksum"]), 64)
+
+    def test_export_specific_point(self):
+        window = self._window()
+        window.observe("a")   # point 1
+        window.observe("b")   # point 2
+        window.advance(5)     # point 3
+        first = os.path.join(self.dir, "p1.json")
+        self.assertEqual(window.export(1, first), 1)
+        with open(first, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["keys"], [["a", 0]])
+        self.assertEqual(doc["now"], 0)
+        self.assertEqual(doc["admitted"], 1)
+
+    def test_export_seq_type_errors(self):
+        window = self._window()
+        window.observe("a")
+        for bad in (0, -1, 2.5, True, "1"):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                window.export(bad, os.path.join(self.dir, "x.json"))
+
+    def test_export_unknown_point_raises_value_error(self):
+        window = self._window()
+        window.observe("a")
+        with self.assertRaises(ValueError):
+            window.export(2, os.path.join(self.dir, "x.json"))
+
+    def test_export_missing_parent_dir(self):
+        window = self._window()
+        window.observe("a")
+        with self.assertRaises(FileNotFoundError):
+            window.export(None, os.path.join(self.dir, "nope", "x.json"))
+
+    def test_export_missing_state_file(self):
+        window = self._window()
+        with self.assertRaises(FileNotFoundError):
+            window.export(None, os.path.join(self.dir, "x.json"))
+        self.assertFalse(os.path.exists(self.state))  # export creates nothing
+
+    def test_restore_roundtrip_and_reexport_identity(self):
+        window = self._window()
+        window.observe("a")
+        window.advance(4)
+        window.observe("b")
+        doc = os.path.join(self.dir, "doc.json")
+        window.export(None, doc)
+        clone = Window(os.path.join(self.dir, "clone"), 10, 3)
+        point = clone.restore(doc)
+        self.assertEqual(point, 1)  # first commit of the clone
+        self.assertEqual(clone.keys(), ["a", "b"])
+        self.assertEqual(clone.stats(), window.stats())
+        again = os.path.join(self.dir, "again.json")
+        self.assertEqual(clone.export(point, again), point)
+        with open(doc, "rb") as fh:
+            original = fh.read()
+        with open(again, "rb") as fh:
+            self.assertEqual(fh.read(), original)
+
+    def test_restore_lands_as_new_commit_point(self):
+        window = self._window()
+        window.observe("a")
+        window.observe("b")
+        doc = os.path.join(self.dir, "doc.json")
+        window.export(1, doc)  # the state holding only "a"
+        self.assertEqual(window.restore(doc), 3)
+        self.assertEqual(window.keys(), ["a"])
+        self.assertEqual(window.stats()["admitted"], 1)
+        again = os.path.join(self.dir, "again.json")
+        self.assertEqual(window.export(3, again), 3)
+
+    def test_restore_missing_file(self):
+        with self.assertRaises(FileNotFoundError):
+            self._window().restore(os.path.join(self.dir, "nope.json"))
+
+    def test_restore_validates_export_document(self):
+        window = self._window()
+        window.observe("a")
+        good_path = os.path.join(self.dir, "good.json")
+        window.export(None, good_path)
+        with open(good_path, encoding="utf-8") as fh:
+            good = json.load(fh)
+        base_body = {k: v for k, v in good.items() if k != "checksum"}
+        no_version = dict(base_body)
+        del no_version["version"]
+        bad_bodies = [
+            no_version,                       # missing version number
+            dict(base_body, version=99),      # unknown version
+            dict(base_body, span=99),         # settings mismatch
+        ]
+        for i, body in enumerate(bad_bodies):
+            path = os.path.join(self.dir, f"bad{i}.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self._export_doc(body))
+            with self.assertRaises(ValueError, msg=f"case {i}"):
+                self._window().restore(path)
+        # tampered with, checksum not recomputed
+        tampered = dict(good)
+        tampered["admitted"] = 42
+        path = os.path.join(self.dir, "tampered.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(tampered, fh)
+        with self.assertRaises(ValueError):
+            self._window().restore(path)
+        # not even JSON
+        path = os.path.join(self.dir, "broken.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{nope")
+        with self.assertRaises(ValueError):
+            self._window().restore(path)
+
+    def test_compaction_keeps_point_numbers_but_drops_history(self):
+        window = self._window(capacity=100)
+        window.observe("k0")
+        original = window_module._MAX_SEGMENTS
+        window_module._MAX_SEGMENTS = 3
+        try:
+            for i in range(1, 6):
+                window.observe(f"k{i}")
+        finally:
+            window_module._MAX_SEGMENTS = original
+        # Six mutation commits, numbered 1..6; compaction renumbered nothing.
+        self.assertEqual(window.export(None, os.path.join(self.dir, "tip.json")), 6)
+        with self.assertRaises(ValueError):
+            window.export(2, os.path.join(self.dir, "old.json"))
+
+    def test_torn_tail_leaves_no_point(self):
+        window = self._window()
+        window.observe("a")
+        with open(os.path.join(self.state, "window.json"), "ab") as fh:
+            fh.write(b'{"kind":"delta","op":"admi')  # interrupted append
+        self.assertEqual(window.export(None, os.path.join(self.dir, "tip.json")), 1)
+        with self.assertRaises(ValueError):
+            window.export(2, os.path.join(self.dir, "next.json"))
+
+    def test_load_does_not_block_on_an_active_writer(self):
+        window = self._window()
+        window.observe("a")
+        release = threading.Event()
+
+        def hold():
+            with window._locked(True):
+                release.wait(5.0)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        time.sleep(0.2)  # let the holder grab the exclusive lock
+        try:
+            started = time.monotonic()
+            clone = self._window()
+            clone.load()
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            thread.join()
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(clone.keys(), ["a"])
+
+
+class CliExportRestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, "-m", "dedupe_window", *args],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_export_restore_flow(self):
+        state = os.path.join(self.dir, "window")
+        self.run_cli("--state", state, "observe", "a")
+        self.run_cli("--state", state, "observe", "b")
+        doc = os.path.join(self.dir, "doc.json")
+        result = self.run_cli("--state", state, "export", doc)
+        self.assertEqual((result.returncode, result.stdout), (0, "2\n"))
+        clone = os.path.join(self.dir, "clone")
+        restored = self.run_cli("--state", clone, "restore", doc)
+        self.assertEqual((restored.returncode, restored.stdout), (0, "1\n"))
+        stats = self.run_cli("--state", clone, "stats")
+        self.assertEqual(
+            stats.stdout,
+            '{"span":60,"capacity":1024,"retained":2,"admitted":2,"expired":0}\n',
+        )
+        # Re-exporting the printed point reproduces the original document.
+        again = os.path.join(self.dir, "again.json")
+        re = self.run_cli("--state", clone, "export", "1", again)
+        self.assertEqual((re.returncode, re.stdout), (0, "1\n"))
+        with open(doc, "rb") as fh:
+            original = fh.read()
+        with open(again, "rb") as fh:
+            self.assertEqual(fh.read(), original)
+
+    def test_export_does_not_create_state_dir(self):
+        state = os.path.join(self.dir, "missing")
+        result = self.run_cli("--state", state, "export", os.path.join(self.dir, "d.json"))
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(os.path.exists(state))
+
+    def test_export_restore_usage_errors_exit_2(self):
+        for args in (
+            ["--state", self.dir, "export"],
+            ["--state", self.dir, "export", "1", "a", "b"],
+            ["--state", self.dir, "export", "x", "a"],
+            ["--state", self.dir, "export", "0", "a"],
+            ["--state", self.dir, "export", "-1", "a"],
+            ["--state", self.dir, "restore"],
+            ["--state", self.dir, "restore", "a", "b"],
+        ):
+            result = self.run_cli(*args)
+            self.assertEqual(result.returncode, 2, args)
+            self.assertIn("usage", result.stderr.lower())
+
+    def test_export_state_errors_exit_1(self):
+        state = os.path.join(self.dir, "window")
+        result = self.run_cli(
+            "--state", state, "export", os.path.join(self.dir, "doc.json")
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        # A point beyond the latest commit.
+        self.run_cli("--state", state, "observe", "a")
+        result = self.run_cli(
+            "--state", state, "export", "7", os.path.join(self.dir, "doc.json")
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+
+    def test_restore_errors_exit_1(self):
+        state = os.path.join(self.dir, "window")
+        missing = self.run_cli(
+            "--state", state, "restore", os.path.join(self.dir, "nope.json")
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertEqual(len(missing.stderr.strip().splitlines()), 1)
+        self.run_cli("--state", state, "observe", "a")
+        doc = os.path.join(self.dir, "doc.json")
+        self.run_cli("--state", state, "export", doc)
+        with open(doc, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        payload["admitted"] = 99  # tamper without recomputing the checksum
+        with open(doc, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        tampered = self.run_cli("--state", os.path.join(self.dir, "clone"), "restore", doc)
+        self.assertEqual(tampered.returncode, 1)
+        self.assertEqual(len(tampered.stderr.strip().splitlines()), 1)
+
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
 def _worker(script):
     return textwrap.dedent(script).strip()
 

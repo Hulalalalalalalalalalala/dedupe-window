@@ -13,7 +13,7 @@ DEFAULT_CAPACITY = 1024
 
 USAGE = (
     "usage: python3 -m dedupe_window --state <dir> "
-    "{observe <key> | seen <key> | stats}"
+    "{observe <key> | seen <key> | stats | export [seq] <path> | restore <path>}"
 )
 
 
@@ -24,6 +24,11 @@ def _usage():
 
 def _corrupt(reason):
     print(f"state file is corrupt: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _fail(reason):
+    print(reason, file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -53,6 +58,19 @@ def _parse(argv):
     elif command == "stats":
         if operands:
             _usage()
+    elif command == "restore":
+        if len(operands) != 1:
+            _usage()
+    elif command == "export":
+        if not 1 <= len(operands) <= 2:
+            _usage()
+        if len(operands) == 2:
+            try:
+                seq = int(operands[0])
+            except ValueError:
+                _usage()
+            if seq <= 0:
+                _usage()
     else:
         _usage()
     return state, command, operands
@@ -100,7 +118,7 @@ def main(argv=None):
             return 0
         window = _open_window(state)
         print(json.dumps(window.seen(operands[0])))
-    else:
+    elif command == "stats":
         # Pure read: never create the directory, never touch the data file.
         if not os.path.exists(path):
             print(
@@ -118,6 +136,25 @@ def main(argv=None):
             return 0
         window = _open_window(state)
         print(json.dumps(window.stats(), separators=(",", ":")))
+    elif command == "export":
+        # Pure read of the state: never create the directory.
+        if len(operands) == 2:
+            seq, dest = int(operands[0]), operands[1]
+        else:
+            seq, dest = None, operands[0]
+        window = _open_window(state)
+        try:
+            point = window.export(seq, dest)
+        except (FileNotFoundError, ValueError) as exc:
+            _fail(str(exc))
+        print(point)
+    else:  # restore
+        window = _open_window(state)
+        try:
+            point = window.restore(operands[0])
+        except (FileNotFoundError, ValueError) as exc:
+            _fail(str(exc))
+        print(point)
     return 0
 
 
