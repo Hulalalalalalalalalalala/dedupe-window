@@ -10,33 +10,42 @@ retained.  Two eviction rules apply:
 
 Persistence is crash safe and versioned.  The state directory holds exactly
 one data file, ``window.json``, in a log-structured format: a checksummed
-base snapshot on the first line followed by small checksummed delta
-segments, one per committed mutation, chained together by sequence number
-and the previous segment's checksum.  A mutation commits by appending its
-segment in place and fsyncing, so the bytes hitting disk stay proportional
-to the change instead of mirroring the whole retained state every time.
-Once the segments grow large relative to the base, the next commit
-compacts: it merges base and segments into a fresh snapshot, writes it to a
-same-directory temporary file, fsyncs it and atomically replaces the data
-file via ``os.replace``.  A crash therefore either leaves the last
-committed state fully recoverable -- an interrupted append only tears the
-uncommitted tail, which readers ignore and the next writer truncates -- or
-produces a deterministic error from ``load``; a half-restored state is
-never returned.  A truncated file, a bad checksum or any other tampering
-raises ``ValueError``; a missing data file raises ``FileNotFoundError``.
+base snapshot followed by checksummed records, one per line, chained by
+sequence number and the previous record's checksum.  Most records are small
+delta segments, one per committed mutation, so the bytes hitting disk stay
+proportional to the change instead of mirroring the whole retained state
+every time.  Periodically a compaction appends an *anchor*: a full snapshot
+of one commit.  Unlike a rewrite, appending an anchor leaves every earlier
+record in place, so each commit keeps the number it arrived with and stays
+locatable: an export returns the same document whether it runs before or
+after a compaction.  Anchors also bound how far a reader replays.
 
-Documents carry a version number.  The current format is version 2;
-version 1 documents (a single whole-state JSON object) are still read,
-upgraded in memory and rewritten in the current format on the next commit.
-A document without a version, with an unknown version, or left in a
-half-migrated shape raises ``ValueError``.
+A mutation commits by appending its record in place and fsyncing.  A crash
+therefore either leaves the last committed state fully recoverable -- an
+interrupted append only tears the uncommitted tail, which readers ignore and
+the next writer truncates -- or produces a deterministic error from
+``load``; a half-restored state is never returned.  A truncated file, a bad
+checksum or any other tampering raises ``ValueError``; a missing data file
+raises ``FileNotFoundError``.
 
-Multiple processes may work the same state directory.  Mutual exclusion uses
-an advisory ``flock`` on a file descriptor opened on the state directory
-itself, so no lock file is ever left behind and the kernel releases the lock
-if a process dies while holding it.  Mutating operations are linearizable:
-each runs as lock -> reload -> mutate -> atomic commit, equivalent to some
-serial execution in arrival order.  Local deployment only; no networking.
+Documents carry a version number.  The current format is version 3;
+version 1 documents (a single whole-state JSON object) and version 2
+documents (a base plus deltas whose compaction rewrote history away) are
+still read, upgraded in memory and rewritten in the current format on the
+next commit.  A document without a version, with an unknown version, or
+left in a half-migrated shape raises ``ValueError``.
+
+Read calls never take the lock.  ``keys``, ``seen``, ``stats`` and
+``export`` open the data file independently of any writer, so a commit or a
+compaction in progress neither blocks them nor leaks a half-written state:
+a reader always observes one whole committed prefix and reports exactly
+that commit -- its key order, counts and current time together, never a
+mix of an old and a new commit.  Only mutating operations take the advisory
+``flock``, held on a file descriptor opened on the state directory itself,
+so no lock file is ever left behind and the kernel releases the lock if a
+process dies while holding it.  Mutations are linearizable: each runs as
+lock -> reload -> mutate -> atomic commit, equivalent to some serial
+execution in arrival order.  Local deployment only; no networking.
 """
 
 from __future__ import annotations
@@ -52,7 +61,7 @@ import tempfile
 _STATE_FILE = "window.json"
 _TMP_PREFIX = _STATE_FILE + "."
 _TMP_SUFFIX = ".tmp"
-_VERSION = 2
+_VERSION = 3
 _REQUIRED_FIELDS = (
     "version",
     "span",
@@ -62,11 +71,13 @@ _REQUIRED_FIELDS = (
     "expired",
     "keys",
 )
-# Compaction policy: rewrite the base snapshot once the appended segments
-# are bigger than it (with a floor so tiny states are not rewritten every
-# commit) or simply too numerous to replay cheaply.
-_MAX_SEGMENTS = 512
-_MIN_BASE_BYTES = 4096
+# Compaction policy: append a fresh anchor once the deltas since the last
+# anchor are bigger than it (with a floor so tiny states are not anchored
+# every commit) or simply too numerous to replay cheaply.
+_MAX_DELTAS = 512
+_MIN_ANCHOR_BYTES = 4096
+
+_EXPORT_FORMAT = "dedupe-window-export"
 
 
 def _is_number(value):
@@ -138,53 +149,61 @@ def _check_entry(item, what):
     return item[0], item[1]
 
 
-def _validate_keys(raw_keys, now, span, capacity):
-    """Validate the retained key list of a snapshot; return entries."""
+def _validate_keys(raw_keys, now, span, capacity, what="state file"):
+    """Validate a retained key list of a snapshot; return entries."""
     if not isinstance(raw_keys, list):
-        raise ValueError("state file keys must be a list")
+        raise ValueError(f"{what} keys must be a list")
     if len(raw_keys) > capacity:
-        raise ValueError("state file holds more keys than the capacity allows")
+        raise ValueError(f"{what} holds more keys than the capacity allows")
     entries = []
     seen_keys = set()
     previous = None
     for item in raw_keys:
-        key, first = _check_entry(item, "state file")
+        key, first = _check_entry(item, what)
         if key in seen_keys:
-            raise ValueError("state file holds a duplicate key")
+            raise ValueError(f"{what} holds a duplicate key")
         if first < 0 or first > now:
-            raise ValueError("state file holds a sighting outside the timeline")
+            raise ValueError(f"{what} holds a sighting outside the timeline")
         if now - first > span:
-            raise ValueError("state file holds a key older than the span")
+            raise ValueError(f"{what} holds a key older than the span")
         if previous is not None and first < previous:
-            raise ValueError("state file keys are not ordered by first sighting")
+            raise ValueError(f"{what} keys are not ordered by first sighting")
         seen_keys.add(key)
         previous = first
         entries.append([key, first])
     return entries
 
 
-def _validate_snapshot(body):
-    """Validate the fields every snapshot carries, whatever the version."""
-    missing = set(_REQUIRED_FIELDS) - body.keys()
+def _validate_settings_body(body, *, what, require_version):
+    """Validate span/capacity/now/counts/keys of one snapshot document."""
+    required = set(_REQUIRED_FIELDS)
+    if not require_version:
+        required.discard("version")
+    missing = required - body.keys()
     if missing:
-        raise ValueError(f"state file is missing fields: {sorted(missing)}")
+        raise ValueError(f"{what} is missing fields: {sorted(missing)}")
     span = body["span"]
     capacity = body["capacity"]
     now = body["now"]
     admitted = body["admitted"]
     expired = body["expired"]
     if not _is_number(span) or not span > 0:
-        raise ValueError("state file has an invalid span")
+        raise ValueError(f"{what} has an invalid span")
     if not _is_number(capacity) or not capacity > 0:
-        raise ValueError("state file has an invalid capacity")
+        raise ValueError(f"{what} has an invalid capacity")
     if not _is_number(now) or now < 0:
-        raise ValueError("state file has an invalid current time")
+        raise ValueError(f"{what} has an invalid current time")
     if not _is_count(admitted):
-        raise ValueError("state file has an invalid admitted count")
+        raise ValueError(f"{what} has an invalid admitted count")
     if not _is_count(expired):
-        raise ValueError("state file has an invalid expired count")
-    entries = _validate_keys(body["keys"], now, span, capacity)
+        raise ValueError(f"{what} has an invalid expired count")
+    entries = _validate_keys(body["keys"], now, span, capacity, what)
     return span, capacity, now, admitted, expired, entries
+
+
+def _validate_snapshot(body):
+    """Validate the fields every on-disk snapshot carries."""
+    return _validate_settings_body(body, what="state file", require_version=True)
 
 
 class _ParsedState:
@@ -200,15 +219,20 @@ class _ParsedState:
         "entries",
         "seq",
         "tip",
-        "base_bytes",
-        "segment_bytes",
-        "segment_count",
+        "anchor_bytes",
+        "delta_bytes",
+        "delta_count",
         "good_offset",
     )
 
     def __init__(self, **fields):
         for name in self.__slots__:
             setattr(self, name, fields[name])
+
+
+# ---------------------------------------------------------------------------
+# Version 1 and version 2 parsing (legacy documents, still readable)
+# ---------------------------------------------------------------------------
 
 
 def _parse_v1(document, size):
@@ -225,9 +249,9 @@ def _parse_v1(document, size):
         entries=entries,
         seq=0,
         tip=document["checksum"],
-        base_bytes=size,
-        segment_bytes=0,
-        segment_count=0,
+        anchor_bytes=size,
+        delta_bytes=0,
+        delta_count=0,
         good_offset=size,
     )
 
@@ -257,21 +281,18 @@ def _parse_v2_single(document, size):
         entries=entries,
         seq=seq,
         tip=document["checksum"],
-        base_bytes=size,
-        segment_bytes=0,
-        segment_count=0,
+        anchor_bytes=size,
+        delta_bytes=0,
+        delta_count=0,
         good_offset=size,
     )
 
 
-def _apply_segment(line, *, span, capacity, now, admitted, expired, seq, tip,
-                   entries, index, max_first):
-    """Validate and replay one delta segment onto the running state.
+def _apply_v2_segment(line, *, span, capacity, now, admitted, expired, seq, tip,
+                      entries, index, max_first):
+    """Validate and replay one version 2 delta segment.
 
-    Returns the new ``(now, admitted, expired, seq, tip, max_first)``.  Every
-    inconsistency raises ValueError; the caller decides whether the segment
-    sits at the end of the file (a torn tail from a crashed writer, to be
-    ignored) or in the middle (corruption, to be reported).
+    Returns the new ``(now, admitted, expired, seq, tip, max_first)``.
     """
     try:
         document = json.loads(line)
@@ -316,8 +337,6 @@ def _apply_segment(line, *, span, capacity, now, admitted, expired, seq, tip,
         if first < max_first:
             raise ValueError("state file segment keys are not ordered by first sighting")
         adds.append([key, first])
-    # Evictions always take the oldest keys first, so the dropped keys are
-    # exactly a prefix of the retained ones.
     if len(drops) > len(entries) or [key for key, _ in entries[:len(drops)]] != drops:
         raise ValueError("state file segment evictions do not match the key order")
     if op == "admit":
@@ -343,8 +362,7 @@ def _parse_v2_log(text):
     """Parse a log-structured version 2 file: base line plus delta lines.
 
     Only the final line may be torn (an interrupted append); it is ignored
-    and its offset recorded so the next writer can truncate it.  Any other
-    inconsistency is corruption and raises ValueError.
+    and its offset recorded so the next writer can truncate it.
     """
     lines = text.split("\n")
     if lines and lines[-1] == "":
@@ -371,7 +389,7 @@ def _parse_v2_log(text):
     for i in range(1, len(lines)):
         line_len = len(lines[i].encode("utf-8")) + 1
         try:
-            now, admitted, expired, seq, tip, max_first = _apply_segment(
+            now, admitted, expired, seq, tip, max_first = _apply_v2_segment(
                 lines[i],
                 span=span,
                 capacity=capacity,
@@ -401,11 +419,276 @@ def _parse_v2_log(text):
         entries=entries,
         seq=seq,
         tip=tip,
-        base_bytes=base_bytes,
-        segment_bytes=segment_bytes,
-        segment_count=segment_count,
+        anchor_bytes=base_bytes,
+        delta_bytes=segment_bytes,
+        delta_count=segment_count,
         good_offset=good_offset,
     )
+
+
+# ---------------------------------------------------------------------------
+# Version 3 parsing: base, appended anchor checkpoints and delta segments
+# ---------------------------------------------------------------------------
+
+
+def _v3_anchor_info(document, *, allow_base):
+    """Validate one v3 base/anchor record; return its snapshot info."""
+    kind = document.get("kind") if isinstance(document, dict) else None
+    if allow_base:
+        kinds = ("base", "anchor")
+    else:
+        kinds = ("anchor",)
+    if kind not in kinds:
+        raise ValueError("state file has an invalid anchor record")
+    body = _verified_body(document, "state file")
+    seq = body.get("seq")
+    if not _is_count(seq):
+        raise ValueError("state file has an invalid sequence number")
+    if kind == "base":
+        if "prev" in body:
+            raise ValueError("state file base must not name a predecessor")
+        prev = None
+    else:
+        if seq <= 0:
+            raise ValueError("state file anchor precedes every commit")
+        prev = body.get("prev")
+        if not isinstance(prev, str):
+            raise ValueError("state file anchor has a malformed predecessor")
+    span, capacity, now, admitted, expired, entries = _validate_snapshot(body)
+    return {
+        "kind": kind,
+        "seq": seq,
+        "prev": body.get("prev"),
+        "tip": document["checksum"],
+        "span": span,
+        "capacity": capacity,
+        "now": now,
+        "admitted": admitted,
+        "expired": expired,
+        "entries": entries,
+    }
+
+
+def _apply_v3_delta(line, state, index, max_first):
+    """Validate and replay one v3 delta; mutate ``state`` in place.
+
+    The delta is small (evicted keys plus newly admitted ``[key, first]``
+    pairs); the post-commit state is derived by replay, never stored.
+    """
+    try:
+        document = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"state file segment is not valid JSON: {exc}") from exc
+    if not isinstance(document, dict) or document.get("kind") != "delta":
+        raise ValueError("state file holds a malformed segment")
+    body = _verified_body(document, "state file segment")
+    fields = ("seq", "prev", "op", "now", "admitted", "expired", "drop", "add")
+    if any(field not in body for field in fields):
+        raise ValueError("state file holds a malformed segment")
+    seg_seq = body["seq"]
+    if not isinstance(seg_seq, int) or isinstance(seg_seq, bool) or seg_seq <= 0:
+        raise ValueError("state file has an invalid sequence number")
+    if seg_seq != state["seq"] + 1:
+        raise ValueError("state file segments are out of order")
+    if body["prev"] != state["tip"]:
+        raise ValueError("state file segment chain is broken")
+    op = body["op"]
+    if op not in ("admit", "sweep"):
+        raise ValueError("state file holds a malformed segment")
+    new_now = body["now"]
+    if not _is_number(new_now) or new_now < state["now"]:
+        raise ValueError("state file segment moves time backwards")
+    new_admitted = body["admitted"]
+    new_expired = body["expired"]
+    if not _is_count(new_admitted) or not _is_count(new_expired):
+        raise ValueError("state file segment has an invalid count")
+    drops = body["drop"]
+    if not isinstance(drops, list) or not all(isinstance(key, str) for key in drops):
+        raise ValueError("state file segment holds malformed evictions")
+    raw_adds = body["add"]
+    if not isinstance(raw_adds, list):
+        raise ValueError("state file segment holds a malformed key entry")
+    entries = state["entries"]
+    adds = []
+    for item in raw_adds:
+        key, first = _check_entry(item, "state file segment")
+        if key in index:
+            raise ValueError("state file segment admits a duplicate key")
+        if first < 0 or first > new_now:
+            raise ValueError("state file segment holds a sighting outside the timeline")
+        if new_now - first > state["span"]:
+            raise ValueError("state file segment holds a key older than the span")
+        if first < max_first:
+            raise ValueError("state file segment keys are not ordered by first sighting")
+        adds.append([key, first])
+    if len(drops) > len(entries) or [key for key, _ in entries[:len(drops)]] != drops:
+        raise ValueError("state file segment evictions do not match the key order")
+    if op == "admit":
+        if new_admitted != state["admitted"] + len(adds) or new_expired != state["expired"]:
+            raise ValueError("state file segment counts are inconsistent")
+    else:
+        if adds or new_admitted != state["admitted"] or new_expired != state["expired"] + len(drops):
+            raise ValueError("state file segment counts are inconsistent")
+    if drops:
+        del entries[:len(drops)]
+        for key in drops:
+            index.discard(key)
+    for key, first in adds:
+        entries.append([key, first])
+        index.add(key)
+        max_first = first
+    if len(entries) > state["capacity"]:
+        raise ValueError("state file holds more keys than the capacity allows")
+    state["now"] = new_now
+    state["admitted"] = new_admitted
+    state["expired"] = new_expired
+    state["seq"] = seg_seq
+    state["tip"] = document["checksum"]
+    return max_first
+
+
+def _state_from_anchor(info):
+    return {
+        "seq": info["seq"],
+        "tip": info["tip"],
+        "span": info["span"],
+        "capacity": info["capacity"],
+        "now": info["now"],
+        "admitted": info["admitted"],
+        "expired": info["expired"],
+        "entries": [list(pair) for pair in info["entries"]],
+    }
+
+
+def _split_lines(text):
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _parse_v3(text):
+    """Parse a version 3 log from its base snapshot.
+
+    Every record is checksum-verified and the prev/seq chain is checked
+    against the record immediately before it, so a tampered record is caught
+    even when an anchor follows it.  Only the final line may be torn (an
+    interrupted append); it is ignored.
+    """
+    lines = _split_lines(text)
+    if not lines:
+        raise ValueError("state file is not valid JSON: the file is empty")
+    last = len(lines) - 1
+
+    def load_line(i):
+        try:
+            return json.loads(lines[i])
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"state file is not valid JSON: {exc}") from exc
+
+    # The first record is always the base snapshot (commit 0).
+    base_doc = load_line(0)
+    if not isinstance(base_doc, dict):
+        raise ValueError("state file must contain a JSON object")
+    base_info = _v3_anchor_info(base_doc, allow_base=True)
+    if base_info["kind"] != "base":
+        raise ValueError("state file has an invalid base snapshot")
+
+    state = _state_from_anchor(base_info)
+    index = {key for key, _ in state["entries"]}
+    max_first = state["entries"][-1][1] if state["entries"] else 0
+    base_len = len(lines[0].encode("utf-8")) + 1
+    good_offset = base_len
+    delta_bytes = 0
+    delta_count = 0
+    anchor_len = base_len
+    prev_tip = base_info["tip"]
+    prev_seq = base_info["seq"]
+
+    for i in range(1, len(lines)):
+        line_len = len(lines[i].encode("utf-8")) + 1
+        torn = i == last
+        try:
+            document = load_line(i)
+            if not isinstance(document, dict):
+                raise ValueError("state file must contain a JSON object")
+            kind = document.get("kind")
+            if kind == "anchor":
+                info = _v3_anchor_info(document, allow_base=False)
+                if info["prev"] != prev_tip or info["seq"] != prev_seq + 1:
+                    raise ValueError("state file anchor chain is broken")
+                if info["span"] != state["span"] or info["capacity"] != state["capacity"]:
+                    raise ValueError("state file anchor changes the settings")
+                # Counts are monotone across commits; the anchor's own
+                # checksum already binds its snapshot to its bytes.
+                if info["admitted"] < state["admitted"] or info["expired"] < state["expired"]:
+                    raise ValueError("state file anchor counts are inconsistent")
+            elif kind == "delta":
+                max_first = _apply_v3_delta(lines[i], state, index, max_first)
+            else:
+                raise ValueError("state file holds a malformed record")
+        except ValueError:
+            if torn:
+                break  # torn tail of an interrupted append: ignore it
+            raise
+        if kind == "anchor":
+            state = _state_from_anchor(info)
+            index = {key for key, _ in state["entries"]}
+            max_first = state["entries"][-1][1] if state["entries"] else 0
+            anchor_len = line_len
+            delta_bytes = 0
+            delta_count = 0
+        else:
+            delta_bytes += line_len
+            delta_count += 1
+        prev_tip = state["tip"]
+        prev_seq = state["seq"]
+        good_offset += line_len
+
+    return _ParsedState(
+        version=3,
+        span=state["span"],
+        capacity=state["capacity"],
+        now=state["now"],
+        admitted=state["admitted"],
+        expired=state["expired"],
+        entries=state["entries"],
+        seq=state["seq"],
+        tip=state["tip"],
+        anchor_bytes=anchor_len,
+        delta_bytes=delta_bytes,
+        delta_count=delta_count,
+        good_offset=good_offset,
+    )
+
+
+# ---------------------------------------------------------------------------
+# File dispatch
+# ---------------------------------------------------------------------------
+
+
+def _decode(raw):
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"state file is not valid UTF-8: {exc}") from exc
+
+
+def _parse_log_text(text):
+    """Parse a multi-line log, dispatching on the version of its first line."""
+    first_line = text.split("\n", 1)[0]
+    try:
+        first = json.loads(first_line)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"state file is not valid JSON: {exc}") from exc
+    if not isinstance(first, dict):
+        raise ValueError("state file must contain a JSON object")
+    version = _version_of(first)
+    if version == 2:
+        return _parse_v2_log(text)
+    if version == 3:
+        return _parse_v3(text)
+    raise ValueError("state file has an unsupported version")
 
 
 def _parse_state_file(path):
@@ -413,9 +696,14 @@ def _parse_state_file(path):
 
     Raises FileNotFoundError when the file is absent and ValueError for
     every form of corruption: bad formatting, a missing or unknown version,
-    a missing or mismatched checksum, a broken segment chain or state that
-    violates the window invariants.  A torn final segment left by a crashed
-    writer is not corruption; it is ignored and its offset reported.
+    a missing or mismatched checksum, a broken chain or state that violates
+    the window invariants.  A torn final record left by a crashed writer is
+    not corruption; it is ignored.
+
+    The read takes no lock.  It observes one whole file content: a commit
+    appended concurrently can only tear the final line (ignored), and a
+    compaction or restore that replaces the file via ``os.replace`` lands as
+    either the old or the new complete file -- never a mixture.
     """
     try:
         with open(path, "rb") as fh:
@@ -424,17 +712,14 @@ def _parse_state_file(path):
         raise
     except OSError as exc:
         raise ValueError(f"state file cannot be read: {exc}") from exc
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"state file is not valid UTF-8: {exc}") from exc
+    text = _decode(raw)
     try:
         document = json.loads(text)
     except json.JSONDecodeError:
         document = None
     if document is not None:
-        # A single JSON object: a version 1 document, or a version 2 file
-        # that so far holds only its base snapshot.
+        # A single JSON object: a version 1/2 document, or a v3 file that so
+        # far holds only its base snapshot.
         if not isinstance(document, dict):
             raise ValueError("state file must contain a JSON object")
         version = _version_of(document)
@@ -442,8 +727,110 @@ def _parse_state_file(path):
             return _parse_v1(document, len(raw))
         if version == 2:
             return _parse_v2_single(document, len(raw))
+        if version == 3:
+            info = _v3_anchor_info(document, allow_base=True)
+            if info["kind"] != "base":
+                raise ValueError("state file has an invalid base snapshot")
+            return _ParsedState(
+                version=3,
+                span=info["span"],
+                capacity=info["capacity"],
+                now=info["now"],
+                admitted=info["admitted"],
+                expired=info["expired"],
+                entries=info["entries"],
+                seq=info["seq"],
+                tip=info["tip"],
+                anchor_bytes=len(raw),
+                delta_bytes=0,
+                delta_count=0,
+                good_offset=len(raw),
+            )
         raise ValueError("state file has an unsupported version")
-    return _parse_v2_log(text)
+    return _parse_log_text(text)
+
+
+def _parse_tip_state(path):
+    """Reconstruct only the latest committed state, without the lock.
+
+    Starts replay at the newest anchor record, so the work is bounded by the
+    records since the last compaction rather than by the whole history.  The
+    anchor is itself checksummed and self-validating; full-chain validation
+    stays with :func:`_parse_state_file`, used by ``load`` and every writer.
+    Raises FileNotFoundError when absent and ValueError on corruption.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"state file cannot be read: {exc}") from exc
+    text = _decode(raw)
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        document = None
+    if document is not None:
+        # One whole-state object: the file's single record, parse it fully.
+        return _parse_state_file(path)
+    lines = _split_lines(text)
+    if not lines:
+        raise ValueError("state file is not valid JSON: the file is empty")
+    last = len(lines) - 1
+    first_doc = json.loads(lines[0])
+    if not isinstance(first_doc, dict):
+        raise ValueError("state file must contain a JSON object")
+    version = _version_of(first_doc)
+    if version == 2:
+        # v2 has exactly one base and compaction rewrote the file, so replay
+        # is already from the only anchor.
+        return _parse_v2_log(text)
+    if version != 3:
+        raise ValueError("state file has an unsupported version")
+    anchor_i = None
+    anchor_info = None
+    for i in range(last, -1, -1):
+        try:
+            doc = json.loads(lines[i])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(doc, dict) and doc.get("kind") in ("base", "anchor"):
+            try:
+                anchor_info = _v3_anchor_info(doc, allow_base=True)
+            except ValueError:
+                # A torn compaction anchor at the tail; try the previous one.
+                continue
+            anchor_i = i
+            break
+    if anchor_i is None:
+        raise ValueError("state file has no recoverable anchor")
+    info = anchor_info
+    state = _state_from_anchor(info)
+    index = {key for key, _ in state["entries"]}
+    max_first = state["entries"][-1][1] if state["entries"] else 0
+    for i in range(anchor_i + 1, len(lines)):
+        try:
+            max_first = _apply_v3_delta(lines[i], state, index, max_first)
+        except ValueError:
+            if i == last:
+                break  # torn tail of an append in progress
+            raise
+    return _ParsedState(
+        version=3,
+        span=state["span"],
+        capacity=state["capacity"],
+        now=state["now"],
+        admitted=state["admitted"],
+        expired=state["expired"],
+        entries=state["entries"],
+        seq=state["seq"],
+        tip=state["tip"],
+        anchor_bytes=0,
+        delta_bytes=0,
+        delta_count=0,
+        good_offset=-1,
+    )
 
 
 def read_settings(path):
@@ -454,6 +841,45 @@ def read_settings(path):
     """
     parsed = _parse_state_file(path)
     return parsed.span, parsed.capacity
+
+
+# ---------------------------------------------------------------------------
+# Export documents
+# ---------------------------------------------------------------------------
+
+
+def _export_body(snapshot):
+    """The checksum-covered body of an export document."""
+    return {
+        "format": _EXPORT_FORMAT,
+        "seq": snapshot["seq"],
+        "span": snapshot["span"],
+        "capacity": snapshot["capacity"],
+        "now": snapshot["now"],
+        "admitted": snapshot["admitted"],
+        "expired": snapshot["expired"],
+        "keys": [[key, first] for key, first in snapshot["entries"]],
+    }
+
+
+def _make_export_document(snapshot):
+    body = _export_body(snapshot)
+    envelope = dict(body)
+    envelope["checksum"] = _checksum(body)
+    return envelope
+
+
+def _validate_export(body):
+    """Validate the contents of an export document; return its fields."""
+    if body.get("format") != _EXPORT_FORMAT:
+        raise ValueError("export document has an unrecognized format")
+    seq = body.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq <= 0:
+        raise ValueError("export document has an invalid sequence number")
+    span, capacity, now, admitted, expired, entries = _validate_settings_body(
+        body, what="export document", require_version=False
+    )
+    return seq, span, capacity, now, admitted, expired, entries
 
 
 class Window:
@@ -478,22 +904,24 @@ class Window:
         self._admitted = 0
         self._expired = 0
         self._last_commit = None    # checksum at the tip of the chain last seen
-        self._seq = 0               # sequence number of the last segment
+        self._seq = 0               # sequence number of the last commit
         self._loaded_version = _VERSION  # format of the file last read
         self._file_present = False
         self._file_stamp = None
-        self._base_bytes = 0
-        self._segment_bytes = 0
-        self._segment_count = 0
+        self._anchor_bytes = 0
+        self._delta_bytes = 0
+        self._delta_count = 0
         self._good_offset = 0  # end of the committed prefix of the data file
-        os.makedirs(self._state_dir, exist_ok=True)
+        # Construction has no filesystem side effects: read-only calls on a
+        # window whose directory or data file is absent never create either.
 
     @contextlib.contextmanager
     def _locked(self, exclusive):
         """Hold a flock on the state directory; the directory inode is stable.
 
         Closing the fd releases the lock, so a process killed (or crashed)
-        while holding it never leaves a deadlock behind.
+        while holding it never leaves a deadlock behind.  The caller is
+        responsible for ensuring the directory exists.
         """
         fd = os.open(self._state_dir, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -502,6 +930,11 @@ class Window:
         finally:
             os.close(fd)
 
+    def _ensure_dir(self):
+        os.makedirs(self._state_dir, exist_ok=True)
+
+    # -- mutating, locked operations --------------------------------------
+
     def observe(self, key):
         """Record a sighting; return True only when the key is newly admitted.
 
@@ -509,11 +942,12 @@ class Window:
         serialized as if their calls ran one after another.
         """
         _check_key(key)
+        self._ensure_dir()
         with self._locked(True):
             self._reload_if_present()
             admitted, evicted = self._admit(key)
             if admitted:
-                self._commit_state("admit", drop=evicted, add=[[key, self._now]])
+                self._commit("admit", drop=evicted, add=[[key, self._now]])
             return admitted
 
     def _admit(self, key):
@@ -530,11 +964,6 @@ class Window:
         self._admitted += 1
         return True, evicted
 
-    def seen(self, key):
-        """Report membership without recording anything."""
-        _check_key(key)
-        return key in self._index
-
     def advance(self, now):
         """Move the current time to ``now`` and drop keys older than the span.
 
@@ -542,6 +971,7 @@ class Window:
         """
         if not _is_number(now):
             raise TypeError("now must be an int or float")
+        self._ensure_dir()
         with self._locked(True):
             # Monotonicity is per process: this call must not go back past a
             # time this same process already loaded or requested.
@@ -564,22 +994,138 @@ class Window:
                 dropped.append(key)
             self._expired += len(dropped)
             if moved or dropped:
-                self._commit_state("sweep", drop=dropped, add=[])
+                self._commit("sweep", drop=dropped, add=[])
             return len(dropped)
 
+    def restore(self, document):
+        """Reset the whole window to the state an :meth:`export` captured.
+
+        The reset is one atomic commit: after it returns, key order, counts,
+        current time and settings match the document field by field and the
+        following commits continue numbering from the exported commit's
+        successor.  A crash either leaves the previous state fully intact or
+        the restored state fully in place.
+
+        Raises ``TypeError`` when ``document`` is not an export document
+        object (no guessing from other types) and ``ValueError`` when a field
+        is missing or mistyped, or the checksum does not match the contents.
+        """
+        if not isinstance(document, dict):
+            raise TypeError("restore expects an export document object")
+        body = _verified_body(document, "export document")
+        seq, span, capacity, now, admitted, expired, entries = _validate_export(body)
+        self._ensure_dir()
+        with self._locked(True):
+            self._span = span
+            self._capacity = capacity
+            self._now = now
+            self._admitted = admitted
+            self._expired = expired
+            self._entries = [list(pair) for pair in entries]
+            self._index = {key: first for key, first in self._entries}
+            self._clock = now
+            self._seq = seq
+            # The restored state replaces the whole file atomically; it
+            # becomes the base of a fresh chain at the exported commit.
+            self._write_base_file()
+
+    # -- read-only, lock-free operations ----------------------------------
+
+    def _committed_or_memory(self):
+        """Return one complete committed state, or this window's memory.
+
+        Reads the data file without taking the lock, so a writer in progress
+        neither blocks this call nor shows a half-written record.  When the
+        data file is absent (nothing committed yet) or unreadable, memory is
+        itself a complete state -- the empty window or this process's last
+        good commit -- so a reader always receives whole state, never half.
+        ``load`` and ``export`` are the strict entry points and report a
+        corrupt file as ``ValueError`` instead.
+        """
+        path = os.path.join(self._state_dir, _STATE_FILE)
+        try:
+            parsed = _parse_tip_state(path)
+        except (FileNotFoundError, ValueError):
+            parsed = None
+        if parsed is None:
+            return {
+                "span": self._span,
+                "capacity": self._capacity,
+                "now": self._now,
+                "admitted": self._admitted,
+                "expired": self._expired,
+                "entries": self._entries,
+                "seq": self._seq,
+            }
+        return {
+            "span": parsed.span,
+            "capacity": parsed.capacity,
+            "now": parsed.now,
+            "admitted": parsed.admitted,
+            "expired": parsed.expired,
+            "entries": parsed.entries,
+            "seq": parsed.seq,
+        }
+
+    def seen(self, key):
+        """Report membership without recording anything or waiting on a writer.
+
+        The answer comes from one single committed state; a commit landing
+        concurrently can never split it across an old and a new state.
+        """
+        _check_key(key)
+        snapshot = self._committed_or_memory()
+        return any(k == key for k, _ in snapshot["entries"])
+
     def keys(self):
-        """Retained keys, oldest sighting first."""
-        return [key for key, _ in self._entries]
+        """Retained keys of one committed state, oldest sighting first.
+
+        Read without taking the lock, so a commit in progress neither blocks
+        this nor shows a half-written state.
+        """
+        snapshot = self._committed_or_memory()
+        return [key for key, _ in snapshot["entries"]]
 
     def stats(self):
-        """Span, capacity, retained, admitted and expired counts."""
+        """Span, capacity, retained, admitted and expired counts.
+
+        The retained number and the two counts come from the same single
+        committed state as :meth:`keys`.
+        """
+        snapshot = self._committed_or_memory()
         return {
-            "span": self._span,
-            "capacity": self._capacity,
-            "retained": len(self._entries),
-            "admitted": self._admitted,
-            "expired": self._expired,
+            "span": snapshot["span"],
+            "capacity": snapshot["capacity"],
+            "retained": len(snapshot["entries"]),
+            "admitted": snapshot["admitted"],
+            "expired": snapshot["expired"],
         }
+
+    def export(self, seq):
+        """Export the complete state of one commit as a self-checking document.
+
+        ``seq`` is the commit number assigned in arrival order, starting at
+        1.  The returned dict carries the retained keys in order, the
+        admitted/expired counts, the current time, the settings, the commit
+        number and a checksum over all of it.  A JSON round trip leaves the
+        document unchanged and :meth:`restore` turns it back into exactly
+        that state.  The same commit exports identically before and after a
+        compaction.
+
+        Raises ``TypeError`` when ``seq`` is not an integer (booleans
+        included, with no implicit conversion) and ``ValueError`` when it is
+        not positive, has never been committed, or can no longer be located.
+        """
+        if not isinstance(seq, int) or isinstance(seq, bool):
+            raise TypeError("seq must be an integer")
+        if seq <= 0:
+            raise ValueError("seq must be a positive commit number")
+        snapshot = self._locate_snapshot(seq)
+        if snapshot is None:
+            raise ValueError(f"commit {seq} cannot be located")
+        return _make_export_document(snapshot)
+
+    # -- persistence ------------------------------------------------------
 
     def save(self):
         """Durably persist the window state in the current format.
@@ -591,7 +1137,7 @@ class Window:
         earlier.  When the state is already durable in the current format
         there is nothing to do.
         """
-        os.makedirs(self._state_dir, exist_ok=True)
+        self._ensure_dir()
         with self._locked(True):
             path = os.path.join(self._state_dir, _STATE_FILE)
             try:
@@ -605,7 +1151,7 @@ class Window:
                     return
                 if parsed.version == _VERSION:
                     return  # already durable in the current format
-            self._commit_base()
+            self._write_base_file()
 
     def load(self):
         """Re-read the state file and replace memory only once it checks out.
@@ -648,9 +1194,9 @@ class Window:
         self._last_commit = parsed.tip
         self._seq = parsed.seq
         self._loaded_version = parsed.version
-        self._base_bytes = parsed.base_bytes
-        self._segment_bytes = parsed.segment_bytes
-        self._segment_count = parsed.segment_count
+        self._anchor_bytes = parsed.anchor_bytes
+        self._delta_bytes = parsed.delta_bytes
+        self._delta_count = parsed.delta_count
         self._good_offset = parsed.good_offset
 
     def _sweep_temp_files(self):
@@ -670,45 +1216,46 @@ class Window:
                 except FileNotFoundError:
                     pass
 
-    def _needs_base_write(self):
-        """True when a commit must rewrite the whole snapshot instead of
-        appending one segment: no usable current-format file, or the
-        segments grew enough that it is time to compact them away."""
+    # -- commit machinery -------------------------------------------------
+
+    def _needs_anchor(self):
+        """Whether the next commit must append an anchor checkpoint.
+
+        The first durable record of a v3 file is a base; an upgraded legacy
+        file starts a fresh v3 chain.  Afterwards anchors bound replay once
+        the deltas grow large or numerous.  History is never discarded, so
+        old commits keep their number and stay locatable.
+        """
         if not self._file_present or self._loaded_version != _VERSION:
             return True
-        if self._segment_count >= _MAX_SEGMENTS:
+        if self._delta_count >= _MAX_DELTAS:
             return True
-        return self._segment_bytes >= max(_MIN_BASE_BYTES, self._base_bytes)
+        return self._delta_bytes >= max(_MIN_ANCHOR_BYTES, self._anchor_bytes)
 
-    def _commit_state(self, op=None, drop=(), add=()):
-        """Commit the in-memory state; caller holds the write lock."""
-        self._sweep_temp_files()
-        if op is None or self._needs_base_write():
-            self._commit_base()
-            return
-        try:
-            self._append_segment(op, drop, add)
-        except FileNotFoundError:
-            # The data file vanished from under us; rewrite it wholesale.
-            self._commit_base()
-
-    def _commit_base(self):
-        """Write a full snapshot via temp + fsync + atomic rename."""
-        path = os.path.join(self._state_dir, _STATE_FILE)
+    def _snapshot_body(self, kind, seq, prev):
         body = {
             "version": _VERSION,
-            "kind": "base",
+            "kind": kind,
             "span": self._span,
             "capacity": self._capacity,
             "now": self._now,
             "admitted": self._admitted,
             "expired": self._expired,
-            "seq": self._seq,
+            "seq": seq,
             "keys": [[key, first] for key, first in self._entries],
         }
-        checksum = _checksum(body)
+        if prev is not None:
+            body["prev"] = prev
+        return body
+
+    def _envelope(self, body):
         envelope = dict(body)
-        envelope["checksum"] = checksum
+        envelope["checksum"] = _checksum(body)
+        return envelope
+
+    def _write_whole_file(self, envelope):
+        """Write a record document via temp + fsync + atomic os.replace."""
+        path = os.path.join(self._state_dir, _STATE_FILE)
         data = (
             json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
@@ -735,38 +1282,33 @@ class Window:
                     os.unlink(tmp_name)
                 except OSError:
                     pass
-        self._last_commit = checksum
+        return data
+
+    def _write_base_file(self):
+        """Replace the whole file with one base snapshot atomically.
+
+        Used for the empty initial ``save``, for a format upgrade and for
+        ``restore``.  The base captures the current in-memory commit, so for
+        a never-committed window its seq is 0; for an upgrade it is the
+        legacy file's last commit number and for a restore it is the
+        exported commit number.
+        """
+        body = self._snapshot_body("base", self._seq, None)
+        envelope = self._envelope(body)
+        data = self._write_whole_file(envelope)
+        self._last_commit = envelope["checksum"]
         self._loaded_version = _VERSION
         self._file_present = True
-        self._base_bytes = len(data)
-        self._segment_bytes = 0
-        self._segment_count = 0
+        self._anchor_bytes = len(data)
+        self._delta_bytes = 0
+        self._delta_count = 0
         self._good_offset = len(data)
-        self._file_stamp = _stamp_of(path)
+        self._file_stamp = _stamp_of(os.path.join(self._state_dir, _STATE_FILE))
 
-    def _append_segment(self, op, drop, add):
-        """Commit one mutation by appending a small segment in place.
-
-        Only the tail of the data file is written, so the bytes hitting disk
-        stay proportional to the change, not to the retained state.  A crash
-        can tear the appended line; readers ignore the uncommitted tail and
-        the next writer truncates it before extending the file.
-        """
+    def _append_record(self, body):
+        """Append one checksummed record line in place and fsync it."""
         path = os.path.join(self._state_dir, _STATE_FILE)
-        body = {
-            "kind": "delta",
-            "op": op,
-            "seq": self._seq + 1,
-            "prev": self._last_commit,
-            "now": self._now,
-            "admitted": self._admitted,
-            "expired": self._expired,
-            "drop": list(drop),
-            "add": [list(pair) for pair in add],
-        }
-        checksum = _checksum(body)
-        envelope = dict(body)
-        envelope["checksum"] = checksum
+        envelope = self._envelope(body)
         data = (
             json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
@@ -781,9 +1323,209 @@ class Window:
             os.fsync(fd)
         finally:
             os.close(fd)
+        return envelope["checksum"], data
+
+    def _commit(self, op, drop, add):
+        """Commit the in-memory state as the next commit; caller holds lock."""
+        self._sweep_temp_files()
+        if self._needs_anchor():
+            if not self._file_present or self._loaded_version != _VERSION:
+                # First commit, or the next commit after loading a legacy
+                # document: start a fresh v3 file at THIS commit so the base
+                # snapshot captures the post-commit state.
+                self._seq += 1
+                self._write_base_file()
+                return
+            body = self._snapshot_body("anchor", self._seq + 1, self._last_commit)
+            self._seq += 1
+            checksum, data = self._append_record(body)
+            self._last_commit = checksum
+            self._anchor_bytes = len(data)
+            self._delta_bytes = 0
+            self._delta_count = 0
+            self._good_offset += len(data)
+            self._file_stamp = _stamp_of(os.path.join(self._state_dir, _STATE_FILE))
+            return
+        body = {
+            "version": _VERSION,
+            "kind": "delta",
+            "op": op,
+            "seq": self._seq + 1,
+            "prev": self._last_commit,
+            "now": self._now,
+            "admitted": self._admitted,
+            "expired": self._expired,
+            "drop": list(drop),
+            "add": [list(pair) for pair in add],
+        }
+        checksum, data = self._append_record(body)
         self._seq += 1
         self._last_commit = checksum
-        self._segment_bytes += len(data)
-        self._segment_count += 1
+        self._delta_bytes += len(data)
+        self._delta_count += 1
         self._good_offset += len(data)
-        self._file_stamp = _stamp_of(path)
+        self._file_stamp = _stamp_of(os.path.join(self._state_dir, _STATE_FILE))
+
+    # -- export location --------------------------------------------------
+
+    def _locate_snapshot(self, seq):
+        """Find the state of commit ``seq`` without taking the lock.
+
+        The log is walked from the start; anchors restart replay at their
+        commit, so the walk costs one replay between anchors at most.  A
+        commit an anchor has jumped past without its records present (as
+        happens after a :meth:`restore`, or in an externally trimmed file)
+        cannot be located and returns ``None``.
+        """
+        path = os.path.join(self._state_dir, _STATE_FILE)
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValueError(f"state file cannot be read: {exc}") from exc
+        text = _decode(raw)
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError:
+            document = None
+        if document is not None:
+            if not isinstance(document, dict):
+                raise ValueError("state file must contain a JSON object")
+            version = _version_of(document)
+            if version == 1:
+                return None  # v1 predates commit numbering
+            if version == 2:
+                parsed = _parse_v2_single(document, len(raw))
+                return self._snapshot_if(parsed, seq)
+            if version == 3:
+                info = _v3_anchor_info(document, allow_base=True)
+                if info["kind"] != "base":
+                    raise ValueError("state file has an invalid base snapshot")
+                return self._snapshot_from_info(info, seq)
+            raise ValueError("state file has an unsupported version")
+        return self._locate_in_log(text, seq)
+
+    @staticmethod
+    def _snapshot_if(parsed, seq):
+        if parsed.seq != seq:
+            return None
+        return {
+            "seq": parsed.seq,
+            "span": parsed.span,
+            "capacity": parsed.capacity,
+            "now": parsed.now,
+            "admitted": parsed.admitted,
+            "expired": parsed.expired,
+            "entries": [list(pair) for pair in parsed.entries],
+        }
+
+    @staticmethod
+    def _snapshot_from_info(info, seq):
+        if info["seq"] != seq:
+            return None
+        return {
+            "seq": info["seq"],
+            "span": info["span"],
+            "capacity": info["capacity"],
+            "now": info["now"],
+            "admitted": info["admitted"],
+            "expired": info["expired"],
+            "entries": [list(pair) for pair in info["entries"]],
+        }
+
+    def _locate_in_log(self, text, seq):
+        lines = _split_lines(text)
+        last = len(lines) - 1
+        first_doc = json.loads(lines[0])
+        if not isinstance(first_doc, dict):
+            raise ValueError("state file must contain a JSON object")
+        version = _version_of(first_doc)
+        if version == 2:
+            return self._locate_v2(lines, seq, last)
+        if version != 3:
+            raise ValueError("state file has an unsupported version")
+        info = _v3_anchor_info(first_doc, allow_base=True)
+        if info["kind"] != "base":
+            raise ValueError("state file has an invalid base snapshot")
+        state = _state_from_anchor(info)
+        index = {key for key, _ in state["entries"]}
+        max_first = state["entries"][-1][1] if state["entries"] else 0
+        if state["seq"] == seq:
+            return self._snapshot_of_state(state)
+        if state["seq"] > seq:
+            return None
+        for i in range(1, len(lines)):
+            try:
+                document = json.loads(lines[i])
+            except json.JSONDecodeError:
+                if i == last:
+                    break
+                raise ValueError(f"state file is not valid JSON on line {i}")
+            if not isinstance(document, dict):
+                raise ValueError("state file must contain a JSON object")
+            kind = document.get("kind")
+            if kind == "anchor":
+                info = _v3_anchor_info(document, allow_base=False)
+                if info["prev"] != state["tip"] or info["seq"] != state["seq"] + 1:
+                    raise ValueError("state file anchor chain is broken")
+                state = _state_from_anchor(info)
+                index = {key for key, _ in state["entries"]}
+                max_first = state["entries"][-1][1] if state["entries"] else 0
+            elif kind == "delta":
+                try:
+                    max_first = _apply_v3_delta(lines[i], state, index, max_first)
+                except ValueError:
+                    if i == last:
+                        break
+                    raise
+            else:
+                raise ValueError("state file holds a malformed record")
+            if state["seq"] == seq:
+                return self._snapshot_of_state(state)
+            if state["seq"] > seq:
+                return None
+        return None
+
+    def _locate_v2(self, lines, seq, last):
+        _, base_seq, span, capacity, now, admitted, expired, entries = _parse_v2_base(
+            json.loads(lines[0])
+        )
+        tip = json.loads(lines[0])["checksum"]
+        index = {key for key, _ in entries}
+        max_first = entries[-1][1] if entries else 0
+        if base_seq == seq:
+            return self._snapshot_of_state({
+                "seq": base_seq, "span": span, "capacity": capacity, "now": now,
+                "admitted": admitted, "expired": expired, "entries": entries,
+            })
+        for i in range(1, len(lines)):
+            try:
+                now, admitted, expired, base_seq, tip, max_first = _apply_v2_segment(
+                    lines[i], span=span, capacity=capacity, now=now,
+                    admitted=admitted, expired=expired, seq=base_seq, tip=tip,
+                    entries=entries, index=index, max_first=max_first,
+                )
+            except ValueError:
+                if i == last:
+                    break
+                raise
+            if base_seq == seq:
+                return self._snapshot_of_state({
+                    "seq": base_seq, "span": span, "capacity": capacity, "now": now,
+                    "admitted": admitted, "expired": expired, "entries": entries,
+                })
+        return None
+
+    @staticmethod
+    def _snapshot_of_state(state):
+        return {
+            "seq": state["seq"],
+            "span": state["span"],
+            "capacity": state["capacity"],
+            "now": state["now"],
+            "admitted": state["admitted"],
+            "expired": state["expired"],
+            "entries": [list(pair) for pair in state["entries"]],
+        }
