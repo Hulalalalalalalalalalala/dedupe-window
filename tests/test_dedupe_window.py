@@ -497,6 +497,255 @@ class SegmentedStateTests(unittest.TestCase):
             Window(self.dir, 10, 3).load()
 
 
+class ExportRestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.state = os.path.join(self.dir, "window")
+        self.window = Window(self.state, 10, 5)
+
+    def _build_history(self):
+        # commit 1: admit a at now 0; commit 2: advance to 4; commit 3: b;
+        # commit 4: c; commit 5: advance to 12 expires a (12 - 0 > 10).
+        self.window.observe("a")
+        self.window.advance(4)
+        self.window.observe("b")
+        self.window.observe("c")
+        self.window.advance(12)
+        self.assertEqual(self.window._seq, 5)
+
+    def test_commits_number_from_one_in_arrival_order(self):
+        self._build_history()
+        for seq in range(1, 6):
+            doc = self.window.export(seq)
+            self.assertEqual(doc["seq"], seq)
+
+    def test_export_matches_one_complete_commit(self):
+        self._build_history()
+        self.assertEqual(
+            self.window.export(1)["keys"], [["a", 0]]
+        )
+        self.assertEqual(self.window.export(2)["keys"], [["a", 0]])
+        self.assertEqual(self.window.export(2)["now"], 4)
+        self.assertEqual(self.window.export(3)["keys"], [["a", 0], ["b", 4]])
+        self.assertEqual(self.window.export(4)["keys"], [["a", 0], ["b", 4], ["c", 4]])
+        tip = self.window.export(5)
+        self.assertEqual(tip["keys"], [["b", 4], ["c", 4]])
+        self.assertEqual((tip["admitted"], tip["expired"]), (3, 1))
+        self.assertEqual((tip["span"], tip["capacity"], tip["now"]), (10, 5, 12))
+
+    def test_export_document_survives_json_round_trip(self):
+        self._build_history()
+        for seq in range(1, 6):
+            doc = self.window.export(seq)
+            self.assertEqual(json.loads(json.dumps(doc)), doc)
+
+    def test_export_carries_checksum_and_markers(self):
+        self.window.observe("a")
+        doc = self.window.export(1)
+        self.assertEqual(len(doc["checksum"]), 64)
+        self.assertEqual(doc["format"], "dedupe-window-export")
+        self.assertIn("export_version", doc)
+
+    def test_export_sequence_type_validation(self):
+        self.window.observe("a")
+        for bad in (True, False, 1.0, "1", None, [1]):
+            with self.assertRaises(TypeError, msg=bad):
+                self.window.export(bad)
+
+    def test_export_non_positive_is_value_error(self):
+        self.window.observe("a")
+        for bad in (0, -1):
+            with self.assertRaises(ValueError):
+                self.window.export(bad)
+
+    def test_export_never_committed_is_value_error(self):
+        self.window.observe("a")
+        with self.assertRaises(ValueError):
+            self.window.export(2)
+        # nothing at all on disk yet
+        fresh = Window(os.path.join(self.dir, "fresh"), 10, 5)
+        with self.assertRaises(ValueError):
+            fresh.export(1)
+
+    def test_restore_rebuilds_state_item_for_item(self):
+        self._build_history()
+        doc = json.loads(json.dumps(self.window.export(3)))
+        target = os.path.join(self.dir, "restored")
+        window = Window(target, 10, 5)
+        window.restore(doc)
+        self.assertEqual(window.keys(), ["a", "b"])
+        self.assertEqual(window.stats(), {
+            "span": 10, "capacity": 5, "retained": 2,
+            "admitted": 2, "expired": 0,
+        })
+        clone = Window(target, 10, 5)
+        clone.load()
+        self.assertEqual(clone.keys(), ["a", "b"])
+        self.assertEqual(clone.stats(), window.stats())
+
+    def test_restore_then_commits_continue_the_sequence(self):
+        self._build_history()
+        doc = self.window.export(3)
+        self.window.restore(doc)
+        self.assertEqual(self.window._seq, 3)
+        self.window.observe("d")  # commit 4, not 1 again
+        self.assertEqual(self.window._seq, 4)
+        self.assertEqual(self.window.export(4)["keys"],
+                         [["a", 0], ["b", 4], ["d", 4]])
+        clone = Window(self.state, 10, 5)
+        clone.load()
+        self.assertEqual(clone._seq, 4)
+
+    def test_restore_in_place_rolls_entire_window_back(self):
+        self._build_history()
+        doc = self.window.export(2)
+        self.window.restore(doc)
+        self.assertEqual(self.window.keys(), ["a"])
+        self.assertEqual(self.window.stats()["admitted"], 1)
+        self.assertEqual(self.window.stats()["expired"], 0)
+
+    def test_restore_rejects_other_types(self):
+        for bad in (None, 5, 1.0, "export", ["x"], json.dumps(self._doc_or_none())):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                Window(os.path.join(self.dir, "t"), 10, 5).restore(bad)
+
+    def _doc_or_none(self):
+        self.window.observe("a")
+        return self.window.export(1)
+
+    def test_restore_rejects_missing_fields(self):
+        self.window.observe("a")
+        doc = self.window.export(1)
+        for field in ("seq", "span", "capacity", "now", "admitted",
+                      "expired", "keys", "checksum", "format", "export_version"):
+            broken = dict(doc)
+            del broken[field]
+            with self.assertRaises(ValueError, msg=field):
+                Window(os.path.join(self.dir, "m"), 10, 5).restore(broken)
+
+    def test_restore_rejects_extra_fields(self):
+        self.window.observe("a")
+        doc = self.window.export(1)
+        broken = dict(doc)
+        broken["unexpected"] = 1
+        with self.assertRaises(ValueError):
+            Window(os.path.join(self.dir, "x"), 10, 5).restore(broken)
+
+    def test_restore_rejects_wrong_types(self):
+        self.window.observe("a")
+        doc = self.window.export(1)
+        for field, value in (
+            ("seq", "1"), ("seq", True), ("seq", 0),
+            ("span", "10"), ("capacity", -1),
+            ("now", "later"), ("admitted", 1.5), ("expired", -1),
+            ("keys", {}), ("keys", [["a", "later"]]),
+        ):
+            broken = dict(doc)
+            broken[field] = value
+            with self.assertRaises(ValueError, msg=(field, value)):
+                Window(os.path.join(self.dir, "w"), 10, 5).restore(broken)
+
+    def test_restore_rejects_bad_checksum(self):
+        self.window.observe("a")
+        doc = self.window.export(1)
+        broken = dict(doc)
+        broken["admitted"] = 99  # payload edited, checksum not recomputed
+        with self.assertRaises(ValueError):
+            Window(os.path.join(self.dir, "c"), 10, 5).restore(broken)
+        forged = dict(doc)
+        forged["checksum"] = "0" * 64
+        with self.assertRaises(ValueError):
+            Window(os.path.join(self.dir, "c2"), 10, 5).restore(forged)
+
+    def test_restore_rejects_settings_mismatch(self):
+        self.window.observe("a")
+        doc = self.window.export(1)
+        with self.assertRaises(ValueError):
+            Window(os.path.join(self.dir, "s1"), 99, 5).restore(doc)
+        with self.assertRaises(ValueError):
+            Window(os.path.join(self.dir, "s2"), 10, 99).restore(doc)
+
+    def test_failed_restore_creates_nothing(self):
+        target = os.path.join(self.dir, "untouched")
+        window = Window(target, 10, 5)
+        with self.assertRaises(TypeError):
+            window.restore("not a document")
+        with self.assertRaises(ValueError):
+            window.restore({"format": "dedupe-window-export"})
+        self.assertFalse(os.path.exists(target))
+
+    def test_compacted_away_commit_is_value_error(self):
+        window = Window(os.path.join(self.dir, "big"), 100000, 100000)
+        for i in range(600):
+            window.observe(f"key-{i:04d}-" + "x" * 12)
+        self.assertGreater(window._segment_count, 0)
+        while window._segment_count > 0:  # cross the compaction threshold
+            window.observe(f"compact-{window._seq}-" + "y" * 60)
+        with open(os.path.join(self.dir, "big", "window.json"), "rb") as fh:
+            base_seq = json.loads(fh.readline())["seq"]
+        self.assertGreater(base_seq, 1)
+        with self.assertRaises(ValueError):
+            window.export(base_seq - 1)
+        # the base commit and the tip are still locatable and complete
+        self.assertEqual(window.export(base_seq)["seq"], base_seq)
+        tip = window.export(window._seq)
+        self.assertEqual(tip["admitted"], window.stats()["admitted"])
+        self.assertEqual([k for k, _ in tip["keys"]], window.keys())
+
+    def test_torn_tail_never_looks_like_a_commit(self):
+        self.window.observe("a")
+        self.window.observe("b")
+        tip = self.window._seq
+        with open(os.path.join(self.state, "window.json"), "ab") as fh:
+            fh.write(b'{"kind":"delta","op":"admi')
+        reader = Window(self.state, 10, 5)
+        reader.load()
+        self.assertEqual(reader.keys(), ["a", "b"])
+        self.assertEqual(reader.export(tip)["keys"], [["a", 0], ["b", 0]])
+        with self.assertRaises(ValueError):
+            reader.export(tip + 1)
+
+    def test_constructor_and_reads_do_not_create_anything(self):
+        target = os.path.join(self.dir, "readonly")
+        window = Window(target, 10, 5)
+        self.assertFalse(os.path.exists(target))
+        with self.assertRaises(FileNotFoundError):
+            window.load()
+        with self.assertRaises(ValueError):
+            window.export(1)
+        self.assertFalse(os.path.exists(target))
+        self.window.observe("a")
+        self.assertFalse(os.path.exists(target))
+
+
+class LockFreeReadTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.state = os.path.join(self.dir, "window")
+        Window(self.state, 10, 3).observe("seed")
+
+    def test_load_does_not_wait_for_a_writer(self):
+        script = _worker("""
+            import sys, time
+            from dedupe_window import Window
+            w = Window(sys.argv[1], 10, 3)
+            with w._locked(True):
+                time.sleep(2.0)
+        """)
+        env = dict(os.environ, PYTHONPATH=_REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
+        holder = subprocess.Popen([sys.executable, "-c", script, self.state], env=env)
+        time.sleep(0.5)
+        try:
+            started = time.monotonic()
+            reader = Window(self.state, 10, 3)
+            reader.load()
+            self.assertTrue(reader.seen("seed"))
+            self.assertEqual(reader.export(1)["keys"], [["seed", 0]])
+            self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            holder.communicate()
+
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
