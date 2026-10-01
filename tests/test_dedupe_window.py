@@ -267,6 +267,290 @@ class CliTests(unittest.TestCase):
         self.assertEqual((again.returncode, again.stdout), (0, "false\n"))
 
 
+class CliExportTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.state = os.path.join(self.dir, "window")
+        for key in ("a", "b"):
+            self.run_cli("--state", self.state, "observe", key)
+
+    def run_cli(self, *args, input=None):
+        return subprocess.run(
+            [sys.executable, "-m", "dedupe_window", *args],
+            capture_output=True,
+            text=True,
+            input=input,
+        )
+
+    def test_export_writes_the_committed_document(self):
+        first = self.run_cli("--state", self.state, "export", "1")
+        self.assertEqual(first.returncode, 0)
+        document = json.loads(first.stdout)
+        self.assertEqual(document["format"], "dedupe-window-export")
+        self.assertEqual(document["seq"], 1)
+        self.assertEqual(document["admitted"], 1)
+        self.assertEqual(document["keys"], [["a", 0]])
+        self.assertEqual(len(document["checksum"]), 64)
+        second = self.run_cli("--state", self.state, "export", "2")
+        self.assertEqual(
+            json.loads(second.stdout)["keys"], [["a", 0], ["b", 0]]
+        )
+        # Exactly one JSON object followed by a newline.
+        self.assertTrue(second.stdout.endswith("\n"))
+        self.assertEqual(second.stdout.count("\n"), 1)
+
+    def test_export_survives_json_round_trip_with_checksum_intact(self):
+        result = self.run_cli("--state", self.state, "export", "2")
+        document = json.loads(result.stdout)
+        body = {key: value for key, value in document.items() if key != "checksum"}
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(
+            hashlib.sha256(canonical).hexdigest(), document["checksum"]
+        )
+
+    def test_export_is_a_pure_read(self):
+        path = os.path.join(self.state, "window.json")
+        before = open(path, "rb").read()
+        for seq in ("1", "2"):
+            result = self.run_cli("--state", self.state, "export", seq)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, "")
+        self.assertEqual(open(path, "rb").read(), before)
+        self.assertEqual(sorted(os.listdir(self.state)), ["window.json"])
+
+    def test_export_on_missing_state_is_corrupt_exit_1_without_creating_files(self):
+        missing = os.path.join(self.dir, "absent")
+        result = self.run_cli("--state", missing, "export", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertTrue(result.stderr.startswith("state file is corrupt"))
+        self.assertFalse(os.path.exists(missing))
+
+    def test_export_on_corrupt_state_exits_1(self):
+        corrupt = os.path.join(self.dir, "corrupt")
+        os.makedirs(corrupt)
+        with open(os.path.join(corrupt, "window.json"), "w") as fh:
+            fh.write("{broken")
+        result = self.run_cli("--state", corrupt, "export", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith("state file is corrupt"))
+
+    def test_export_usage_errors_exit_2(self):
+        for operands in (
+            [],
+            ["1", "2"],
+            ["abc"],
+            ["-1"],
+            ["+1"],
+            ["1.0"],
+            ["0x1"],
+            [""],
+            [" 1"],
+        ):
+            result = self.run_cli("--state", self.state, "export", *operands)
+            self.assertEqual(result.returncode, 2, operands)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("usage", result.stderr.lower())
+
+    def test_export_zero_and_unknown_seq_exit_1(self):
+        for seq in ("0", "3", "999"):
+            result = self.run_cli("--state", self.state, "export", seq)
+            self.assertEqual(result.returncode, 1, seq)
+            self.assertEqual(result.stdout, "")
+            self.assertTrue(result.stderr.startswith("state file is corrupt"))
+
+    def test_export_matches_before_and_after_compaction(self):
+        # Enough commits to force an anchor (>= 512 deltas); the document of an
+        # early commit must stay identical across the compaction.
+        state = os.path.join(self.dir, "big")
+        window = Window(state, 1_000_000, 1_000_000)
+        for i in range(600):
+            window.observe(f"k{i}")
+        expected = window.export(100)
+        result = self.run_cli("--state", state, "export", "100")
+        self.assertEqual(json.loads(result.stdout), expected)
+
+
+class CliRestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.source = os.path.join(self.dir, "source")
+        for key in ("a", "b"):
+            subprocess.run(
+                [sys.executable, "-m", "dedupe_window",
+                 "--state", self.source, "observe", key],
+                capture_output=True, check=True,
+            )
+        snap = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", self.source, "export", "2"],
+            capture_output=True, text=True, check=True,
+        )
+        self.document = snap.stdout
+
+    def run_restore(self, state, payload):
+        return subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", state, "restore"],
+            input=payload, capture_output=True, text=True,
+        )
+
+    def test_restore_creates_state_and_prints_stats_like_stats_command(self):
+        target = os.path.join(self.dir, "restored")
+        result = self.run_restore(target, self.document)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        stats = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", target, "stats"],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(result.stdout, stats.stdout)
+        self.assertEqual(
+            result.stdout,
+            '{"span":60,"capacity":1024,"retained":2,'
+            '"admitted":2,"expired":0}\n',
+        )
+        seen = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", target, "seen", "b"],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(seen.stdout, "true\n")
+
+    def test_later_commits_continue_after_the_exported_number(self):
+        target = os.path.join(self.dir, "target")
+        self.assertEqual(self.run_restore(target, self.document).returncode, 0)
+        admitted = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", target, "observe", "c"],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(admitted.stdout, "true\n")
+        third = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", target, "export", "3"],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(
+            json.loads(third.stdout)["keys"],
+            [["a", 0], ["b", 0], ["c", 0]],
+        )
+        # History was rolled back: commit 1 cannot be located anymore.
+        gone = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", target, "export", "1"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(gone.returncode, 1)
+
+    def test_restore_overwrites_a_healthy_old_state(self):
+        target = os.path.join(self.dir, "healthy")
+        for key in ("zzz", "yyy", "xxx"):
+            subprocess.run(
+                [sys.executable, "-m", "dedupe_window",
+                 "--state", target, "observe", key],
+                capture_output=True, check=True,
+            )
+        result = self.run_restore(target, self.document)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        window = Window(target, 60, 1024)
+        window.load()
+        self.assertEqual(window.keys(), ["a", "b"])
+        self.assertEqual(sorted(os.listdir(target)), ["window.json"])
+
+    def test_restore_repairs_a_corrupt_old_state(self):
+        target = os.path.join(self.dir, "corrupt")
+        os.makedirs(target)
+        with open(os.path.join(target, "window.json"), "w") as fh:
+            fh.write("{broken")
+        result = self.run_restore(target, self.document)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The repaired file loads cleanly and keeps only the data file.
+        window = Window(target, 60, 1024)
+        window.load()
+        self.assertEqual(window.keys(), ["a", "b"])
+        self.assertEqual(sorted(os.listdir(target)), ["window.json"])
+
+    def test_restore_accepts_surrounding_whitespace(self):
+        target = os.path.join(self.dir, "padded")
+        result = self.run_restore(target, "\n\t " + self.document.strip() + " \n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"retained":2', result.stdout)
+
+    def test_restore_rejects_an_operand(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", self.dir, "restore", "x"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage", result.stderr.lower())
+
+    def test_restore_failures_exit_1_empty_stdout_one_line(self):
+        document = json.loads(self.document)
+        bad_checksum = dict(document)
+        bad_checksum["checksum"] = "0" * 64
+        missing_field = {
+            key: value for key, value in document.items() if key != "keys"
+        }
+        del missing_field["checksum"]
+        cases = {
+            "not json": "not json at all",
+            "empty": "",
+            "whitespace only": "   \n\t",
+            "array": "[1, 2, 3]",
+            "number": "42",
+            "string": '"hello"',
+            "null": "null",
+            "empty object": "{}",
+            "trailing text": self.document.strip() + "\ngarbage",
+            "second document": self.document.strip() + "\n{}",
+            "leading text": "x " + self.document.strip(),
+            "bad checksum": json.dumps(bad_checksum),
+            "missing field": json.dumps(missing_field),
+            "extra field": json.dumps(dict(document, extra=1)),
+            "non-json whitespace tail": self.document.strip() + "\n\x0b",
+        }
+        for label, payload in cases.items():
+            target = os.path.join(self.dir, "case_" + label.replace(" ", "_"))
+            result = self.run_restore(target, payload)
+            self.assertEqual(result.returncode, 1, label)
+            self.assertEqual(result.stdout, "", label)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, label)
+            self.assertTrue(result.stderr.startswith("restore failed"), label)
+            self.assertFalse(os.path.exists(target), label)
+
+    def test_restore_rejects_non_utf8_input(self):
+        target = os.path.join(self.dir, "bytes")
+        result = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", target, "restore"],
+            input=b"\xff\xfe" + self.document.encode("utf-8"),
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"")
+        self.assertTrue(
+            result.stderr.decode("utf-8", "replace").startswith("restore failed")
+        )
+        self.assertFalse(os.path.exists(target))
+
+    def test_failed_restore_leaves_existing_state_byte_intact(self):
+        target = os.path.join(self.dir, "victim")
+        os.makedirs(target)
+        path = os.path.join(target, "window.json")
+        with open(path, "wb") as fh:
+            fh.write(b"{broken")
+        result = self.run_restore(target, "nonsense")
+        self.assertEqual(result.returncode, 1)
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), b"{broken")
+        self.assertEqual(sorted(os.listdir(target)), ["window.json"])
+
+
 class AtomicCommitTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()

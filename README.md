@@ -15,6 +15,23 @@ Python 3.11 or newer. Standard library only.
     python3 -m dedupe_window --state ./window observe <key>
     python3 -m dedupe_window --state ./window seen <key>
     python3 -m dedupe_window --state ./window stats
+    python3 -m dedupe_window --state ./window export <seq>
+    python3 -m dedupe_window --state ./window restore < checkpoint.json
+
+`export <seq>` writes the self-checking checkpoint of commit `seq` (numbered
+from 1) as one JSON object on standard output. It is a pure read: it never
+creates the state directory or touches the state file, and a missing or
+corrupt state file, a non-positive or unknown commit number exits 1 with
+`state file is corrupt` on standard error and empty standard output.
+
+`restore` reads exactly one such JSON object from standard input (only
+whitespace may surround it) and atomically resets the window to it, over a
+missing, healthy or corrupt old state; on success it prints the same compact
+JSON `stats` would show, and later commits continue from the checkpoint's
+commit number plus one. Invalid input (not JSON, not an object, a missing or
+wrong field, a checksum mismatch, or trailing content) exits 1 with one
+`restore failed` line on standard error, empty standard output, and no state
+directory or file created or modified.
 
 ## Public interface
 
