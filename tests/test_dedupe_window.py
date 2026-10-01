@@ -954,5 +954,209 @@ class LockFreeReadTests(unittest.TestCase):
         self.assertTrue(reader.seen("k4"))
 
 
+class CliExportRestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.src = os.path.join(self.dir, "src")
+        for key in "abc":
+            subprocess.run(
+                [sys.executable, "-m", "dedupe_window", "--state", self.src,
+                 "observe", key],
+                capture_output=True, text=True, check=True,
+            )
+
+    def run_cli(self, *args, stdin=None):
+        return subprocess.run(
+            [sys.executable, "-m", "dedupe_window", *args],
+            capture_output=True, text=True, input=stdin,
+        )
+
+    def _document(self, seq):
+        result = self.run_cli("--state", self.src, "export", str(seq))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stderr), 0)
+        self.assertTrue(result.stdout.endswith("\n"))
+        return json.loads(result.stdout)
+
+    def test_export_writes_one_self_checking_object(self):
+        window = Window(self.src, 60, 1024)
+        window.load()
+        for seq in (1, 2, 3):
+            result = self.run_cli("--state", self.src, "export", str(seq))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # exactly one JSON object followed by a single newline
+            self.assertEqual(result.stdout.count("\n"), 1)
+            doc = json.loads(result.stdout)
+            self.assertEqual(doc, window.export(seq))
+            # JSON round trip leaves content and checksum unchanged
+            self.assertEqual(json.loads(json.dumps(doc)), doc)
+            self.assertEqual(_export_checksum(doc), doc["checksum"])
+
+    def test_export_is_a_pure_read(self):
+        before = os.listdir(self.src)
+        stamp = os.stat(os.path.join(self.src, "window.json")).st_mtime_ns
+        for seq in (1, 2, 3):
+            result = self.run_cli("--state", self.src, "export", str(seq))
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(self.src), before)
+        self.assertEqual(
+            os.stat(os.path.join(self.src, "window.json")).st_mtime_ns, stamp
+        )
+
+    def test_export_creates_nothing_when_state_is_missing(self):
+        missing = os.path.join(self.dir, "never")
+        result = self.run_cli("--state", missing, "export", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertTrue(result.stderr.startswith("state file is corrupt"))
+        self.assertFalse(os.path.exists(missing))
+
+    def test_export_on_corrupt_state_exits_1_with_empty_stdout(self):
+        state = os.path.join(self.dir, "broken")
+        os.makedirs(state)
+        with open(os.path.join(state, "window.json"), "w", encoding="utf-8") as fh:
+            fh.write("{broken")
+        result = self.run_cli("--state", state, "export", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith("state file is corrupt"))
+
+    def test_export_non_positive_or_unknown_seq_exits_1(self):
+        for seq in ("0", "-1", "-100", "4", "1000000000"):
+            result = self.run_cli("--state", self.src, "export", seq)
+            self.assertEqual(result.returncode, 1, seq)
+            self.assertEqual(result.stdout, "", seq)
+            self.assertTrue(result.stderr.startswith("state file is corrupt"), seq)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, seq)
+
+    def test_export_usage_errors_exit_2(self):
+        for args in (
+            ["--state", self.src, "export"],
+            ["--state", self.src, "export", "1", "2"],
+            ["--state", self.src, "export", "1.0"],
+            ["--state", self.src, "export", "0x1"],
+            ["--state", self.src, "export", "+1"],
+            ["--state", self.src, "export", "abc"],
+            ["--state", self.src, "export", "1 "],
+            ["--state", self.src, "export", " 1"],
+            ["--state", self.src, "export", "true"],
+            ["--state", self.src, "restore", "extra"],
+        ):
+            result = self.run_cli(*args)
+            self.assertEqual(result.returncode, 2, args)
+            self.assertEqual(result.stdout, "", args)
+            self.assertIn("usage", result.stderr.lower(), args)
+
+    def test_pipe_export_into_restore(self):
+        dst = os.path.join(self.dir, "dst")
+        exported = self.run_cli("--state", self.src, "export", "3")
+        restored = self.run_cli("--state", dst, "restore",
+                                stdin=exported.stdout)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        stats = self.run_cli("--state", dst, "stats")
+        self.assertEqual(
+            stats.stdout,
+            '{"span":60,"capacity":1024,"retained":3,'
+            '"admitted":3,"expired":0}\n',
+        )
+        self.assertEqual(restored.stdout, stats.stdout)
+        # the restored document is byte-identical when exported again
+        again = self.run_cli("--state", dst, "export", "3")
+        self.assertEqual(again.stdout, exported.stdout)
+
+    def test_restore_overwrites_a_healthy_state(self):
+        dst = os.path.join(self.dir, "dst")
+        for key in "zzz":
+            self.run_cli("--state", dst, "observe", key)
+        doc = self._document(2)
+        result = self.run_cli("--state", dst, "restore",
+                              stdin=json.dumps(doc))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["retained"], 2)
+        window = Window(dst, doc["span"], doc["capacity"])
+        window.load()
+        self.assertEqual(window.export(2), doc)
+
+    def test_restore_overwrites_a_corrupt_state(self):
+        dst = os.path.join(self.dir, "dst")
+        os.makedirs(dst)
+        with open(os.path.join(dst, "window.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"version":3,"kind":"base",garbage')
+        doc = self._document(1)
+        result = self.run_cli("--state", dst, "restore",
+                              stdin=json.dumps(doc))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        window = Window(dst, doc["span"], doc["capacity"])
+        window.load()
+        self.assertEqual(window.export(1), doc)
+
+    def test_commits_after_restore_continue_from_the_next_number(self):
+        dst = os.path.join(self.dir, "dst")
+        doc = self._document(3)
+        self.run_cli("--state", dst, "restore", stdin=json.dumps(doc))
+        admitted = self.run_cli("--state", dst, "observe", "d")
+        self.assertEqual(admitted.stdout, "true\n")
+        exported = self.run_cli("--state", dst, "export", "4")
+        self.assertEqual(exported.returncode, 0)
+        self.assertEqual(json.loads(exported.stdout)["seq"], 4)
+        gone = self.run_cli("--state", dst, "export", "2")
+        # commit 2 predates the restored base and can no longer be located
+        self.assertEqual(gone.returncode, 1)
+
+    def test_restore_accepts_surrounding_whitespace_only(self):
+        doc = self._document(1)
+        result = self.run_cli(
+            "--state", os.path.join(self.dir, "w1"), "restore",
+            stdin=" \n\t " + json.dumps(doc) + "\n  \t\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_restore_failures_exit_1_and_change_nothing(self):
+        doc = self._document(2)
+
+        def tampered(mutate):
+            bad = json.loads(json.dumps(doc))
+            mutate(bad)
+            return json.dumps(bad)
+
+        inputs = {
+            "empty": "",
+            "whitespace only": "   \n\t",
+            "not json": "{not json",
+            "json array": json.dumps([doc]),
+            "json number": "123",
+            "json string": json.dumps(json.dumps(doc)),
+            "two objects": json.dumps(doc) + json.dumps(doc),
+            "trailing junk": json.dumps(doc) + "junk",
+            "trailing comma": json.dumps(doc)[:-1] + ",}",
+            "missing field": json.dumps({k: v for k, v in doc.items()
+                                         if k != "seq"}),
+            "wrong seq type": tampered(lambda d: d.__setitem__("seq", "2")),
+            "bad checksum": tampered(lambda d: d.__setitem__("admitted", 99)),
+        }
+        for name, payload in inputs.items():
+            dst = os.path.join(self.dir, "case_" + name.replace(" ", "_"))
+            result = self.run_cli("--state", dst, "restore", stdin=payload)
+            self.assertEqual(result.returncode, 1, name)
+            self.assertEqual(result.stdout, "", name)
+            self.assertTrue(result.stderr.startswith("restore failed"), name)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, name)
+            self.assertFalse(os.path.exists(dst), name)
+
+    def test_failed_restore_keeps_the_old_state_file_byte_for_byte(self):
+        dst = os.path.join(self.dir, "dst")
+        self.run_cli("--state", dst, "observe", "keep")
+        with open(os.path.join(dst, "window.json"), "rb") as fh:
+            before = fh.read()
+        result = self.run_cli("--state", dst, "restore", stdin="not json")
+        self.assertEqual(result.returncode, 1)
+        with open(os.path.join(dst, "window.json"), "rb") as fh:
+            after = fh.read()
+        self.assertEqual(after, before)
+        listing = os.listdir(dst)
+        self.assertEqual(listing, ["window.json"])
+
+
 if __name__ == "__main__":
     unittest.main()

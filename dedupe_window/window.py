@@ -997,6 +997,18 @@ class Window:
                 self._commit("sweep", drop=dropped, add=[])
             return len(dropped)
 
+    @staticmethod
+    def _check_restore_document(document):
+        """Validate a would-be restore document without touching the filesystem.
+
+        Pure: performs only the checksum/field checks :meth:`restore` performs
+        before it creates the state directory, so a caller can reject an
+        invalid document without any filesystem side effect.  Returns the
+        fields ``restore`` adopts; raises ``ValueError`` on any mismatch.
+        """
+        body = _verified_body(document, "export document")
+        return _validate_export(body)
+
     def restore(self, document):
         """Reset the whole window to the state an :meth:`export` captured.
 
@@ -1012,8 +1024,15 @@ class Window:
         """
         if not isinstance(document, dict):
             raise TypeError("restore expects an export document object")
-        body = _verified_body(document, "export document")
-        seq, span, capacity, now, admitted, expired, entries = _validate_export(body)
+        (
+            seq,
+            span,
+            capacity,
+            now,
+            admitted,
+            expired,
+            entries,
+        ) = self._check_restore_document(document)
         self._ensure_dir()
         with self._locked(True):
             self._span = span

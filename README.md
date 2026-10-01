@@ -15,6 +15,25 @@ Python 3.11 or newer. Standard library only.
     python3 -m dedupe_window --state ./window observe <key>
     python3 -m dedupe_window --state ./window seen <key>
     python3 -m dedupe_window --state ./window stats
+    python3 -m dedupe_window --state ./window export <seq>
+    python3 -m dedupe_window --state ./window restore
+
+`export <seq>` writes the complete self-checking document of commit `seq`
+(numbered from 1) as one JSON object on standard output, without changing the
+state. `restore` reads exactly one such document from standard input and
+atomically resets the window to it, printing the same compact JSON `stats`
+prints; later commits continue from the restored commit's successor. Pipe an
+export straight into a restore to move or roll back state without touching
+business code:
+
+    python3 -m dedupe_window --state ./old export 12 \
+      | python3 -m dedupe_window --state ./new restore
+
+A bad command line exits 2 with a usage message. `export` exits 1 with a
+`state file is corrupt` message when the state file is missing or corrupt, or
+the commit number is non-positive or unknown; `restore` exits 1 with a
+`restore failed` message for anything that is not one valid checkpoint
+document, and never creates or partly modifies the state in that case.
 
 ## Public interface
 

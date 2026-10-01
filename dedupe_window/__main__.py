@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 from .window import Window, read_settings
@@ -13,8 +14,13 @@ DEFAULT_CAPACITY = 1024
 
 USAGE = (
     "usage: python3 -m dedupe_window --state <dir> "
-    "{observe <key> | seen <key> | stats}"
+    "{observe <key> | seen <key> | stats | export <seq> | restore}"
 )
+
+# A decimal commit number: one or more decimal digits, optionally signed with
+# a leading minus (so non-positive decimals still parse and are rejected as
+# out of range rather than as usage errors).
+_DECIMAL_INT = re.compile(r"-?[0-9]+\Z")
 
 
 def _usage():
@@ -24,6 +30,11 @@ def _usage():
 
 def _corrupt(reason):
     print(f"state file is corrupt: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _restore_failed(reason):
+    print(f"restore failed: {reason}", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -47,10 +58,10 @@ def _parse(argv):
     if not state or len(rest) == 0:
         _usage()
     command, operands = rest[0], rest[1:]
-    if command in ("observe", "seen"):
+    if command in ("observe", "seen", "export"):
         if len(operands) != 1:
             _usage()
-    elif command == "stats":
+    elif command in ("stats", "restore"):
         if operands:
             _usage()
     else:
@@ -85,6 +96,59 @@ def _open_window(state):
     return window
 
 
+def _run_export(state, seq):
+    """Write the self-checking document of commit ``seq`` to stdout.
+
+    Pure read: takes no lock, creates neither the directory nor a state file
+    and never changes the current state.  A missing/corrupt state file, a
+    non-positive or unknown commit number is reported as corruption (exit 1)
+    with an empty stdout.
+    """
+    path = os.path.join(state, "window.json")
+    try:
+        span, capacity = read_settings(path)
+    except FileNotFoundError:
+        _corrupt("state file is missing")
+    except ValueError as exc:
+        _corrupt(str(exc))
+    try:
+        window = Window(state, span, capacity)
+        document = window.export(seq)
+    except (TypeError, ValueError) as exc:
+        _corrupt(str(exc))
+    sys.stdout.write(json.dumps(document, separators=(",", ":")) + "\n")
+
+
+def _run_restore(state):
+    """Reset the state atomically from exactly one JSON object on stdin.
+
+    The whole document -- JSON type, fields and checksum -- is validated
+    before any filesystem call, so an invalid input creates no directory and
+    modifies no state file.  A valid document replaces a missing, healthy or
+    corrupt old state, after which the same compact JSON a ``stats`` call
+    prints describes the restored window.
+    """
+    raw = sys.stdin.buffer.read()
+    try:
+        document = json.loads(raw)
+    except ValueError as exc:
+        # Covers malformed JSON, an empty input and trailing non-whitespace.
+        _restore_failed(f"input is not one JSON object: {exc}")
+    if not isinstance(document, dict):
+        _restore_failed("input is not a JSON object")
+    try:
+        # Pure validation only: no directory or file may be touched until the
+        # document is known to be a valid checkpoint.
+        _seq, span, capacity, _now, _admitted, _expired, _entries = (
+            Window._check_restore_document(document)
+        )
+        window = Window(state, span, capacity)
+        window.restore(document)  # one locked, atomic base-file commit
+    except (TypeError, ValueError, OSError) as exc:
+        _restore_failed(str(exc))
+    sys.stdout.write(json.dumps(window.stats(), separators=(",", ":")) + "\n")
+
+
 def main(argv=None):
     state, command, operands = _parse(list(sys.argv[1:] if argv is None else argv))
     path = os.path.join(state, "window.json")
@@ -100,6 +164,13 @@ def main(argv=None):
             return 0
         window = _open_window(state)
         print(json.dumps(window.seen(operands[0])))
+    elif command == "export":
+        token = operands[0]
+        if not _DECIMAL_INT.match(token):
+            _usage()
+        _run_export(state, int(token))
+    elif command == "restore":
+        _run_restore(state)
     else:
         # Pure read: never create the directory, never touch the data file.
         if not os.path.exists(path):
