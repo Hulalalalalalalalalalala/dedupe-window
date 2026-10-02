@@ -55,6 +55,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import tempfile
 
@@ -83,6 +84,11 @@ _EXPORT_FORMAT = "dedupe-window-export"
 def _is_number(value):
     """Numbers are ints or floats; booleans do not count."""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_finite_time(value):
+    """A timestamp or watermark: a non-boolean finite non-negative number."""
+    return _is_number(value) and math.isfinite(value) and value >= 0
 
 
 def _is_count(value):
@@ -497,6 +503,10 @@ def _apply_v3_delta(line, state, index, max_first):
         return _apply_v3_batch_delta(
             body, state, index, max_first, document["checksum"]
         )
+    if op == "events":
+        return _apply_v3_events_delta(
+            body, state, index, max_first, document["checksum"]
+        )
     fields = ("now", "admitted", "expired", "drop", "add")
     if any(field not in body for field in fields):
         raise ValueError("state file holds a malformed segment")
@@ -611,6 +621,112 @@ def _apply_v3_batch_delta(body, state, index, max_first, checksum):
     state["entries"] = simulated
     index.clear()
     index.update(simulated_index)
+    state["admitted"] = new_admitted
+    state["expired"] = new_expired
+    state["seq"] = body["seq"]
+    state["tip"] = checksum
+    return simulated[-1][1] if simulated else max_first
+
+
+_EVENT_KINDS = ("admitted", "duplicate", "late")
+
+
+def _insert_by_first(entries, pair):
+    """Insert ``[key, first]`` ordered by first sighting, ties last.
+
+    Equal timestamps keep admission order: an earlier entry (retained from a
+    previous commit or admitted earlier in this batch) stays ahead of a new
+    one.
+    """
+    timestamp = pair[1]
+    lo, hi = 0, len(entries)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if entries[mid][1] <= timestamp:
+            lo = mid + 1
+        else:
+            hi = mid
+    entries.insert(lo, pair)
+
+
+def _apply_v3_events_delta(body, state, index, max_first, checksum):
+    """Validate and replay one v3 event-time batch segment.
+
+    Like the key batch segment, the segment stores the inputs (each event's
+    key and timestamp) and the per-item result kinds; replay advances the
+    watermark, expires the span prefix and recomputes every classification,
+    including a key expired or capacity-evicted and readmitted within the
+    same commit.
+    """
+    fields = ("now", "admitted", "expired", "wmark", "events", "kinds")
+    if any(field not in body for field in fields):
+        raise ValueError("state file holds a malformed segment")
+    pre_now = state["now"]
+    wmark = body["wmark"]
+    if not _is_finite_time(wmark) or wmark != pre_now:
+        raise ValueError("state file events segment moves the previous watermark")
+    new_now = body["now"]
+    if not _is_finite_time(new_now) or new_now < pre_now:
+        raise ValueError("state file segment moves time backwards")
+    new_admitted = body["admitted"]
+    new_expired = body["expired"]
+    if not _is_count(new_admitted) or not _is_count(new_expired):
+        raise ValueError("state file segment has an invalid count")
+    raw_events = body["events"]
+    raw_kinds = body["kinds"]
+    if (
+        not isinstance(raw_events, list)
+        or not isinstance(raw_kinds, list)
+        or len(raw_kinds) != len(raw_events)
+        or not all(isinstance(kind, str) and kind in _EVENT_KINDS
+                   for kind in raw_kinds)
+    ):
+        raise ValueError("state file events segment is malformed")
+    events = []
+    for item in raw_events:
+        key, timestamp = _check_entry(item, "state file segment")
+        if not _is_finite_time(timestamp) or timestamp > new_now:
+            raise ValueError("state file segment holds an event outside the timeline")
+        events.append((key, timestamp))
+
+    span = state["span"]
+    capacity = state["capacity"]
+    simulated = [list(pair) for pair in state["entries"]]
+    simulated_index = set(index)
+    expiry_count = 0
+    while simulated and new_now - simulated[0][1] > span:
+        oldest, _ = simulated.pop(0)
+        simulated_index.discard(oldest)
+        expiry_count += 1
+    expected_kinds = []
+    admitted_count = 0
+    for key, timestamp in events:
+        if new_now - timestamp > span:
+            expected_kinds.append("late")
+            continue
+        if key in simulated_index:
+            expected_kinds.append("duplicate")
+            continue
+        expected_kinds.append("admitted")
+        admitted_count += 1
+        while len(simulated) >= capacity:
+            oldest, _ = simulated.pop(0)
+            simulated_index.discard(oldest)
+        pair = [key, timestamp]
+        _insert_by_first(simulated, pair)
+        simulated_index.add(key)
+    if raw_kinds != expected_kinds:
+        raise ValueError("state file events segment results are inconsistent")
+    if new_admitted != state["admitted"] + admitted_count:
+        raise ValueError("state file segment counts are inconsistent")
+    if new_expired != state["expired"] + expiry_count:
+        raise ValueError("state file segment counts are inconsistent")
+    if len(simulated) > capacity:
+        raise ValueError("state file holds more keys than the capacity allows")
+    state["entries"] = simulated
+    index.clear()
+    index.update(simulated_index)
+    state["now"] = new_now
     state["admitted"] = new_admitted
     state["expired"] = new_expired
     state["seq"] = body["seq"]
@@ -1083,6 +1199,126 @@ class Window:
                 self._commit("batch", [], [], batch_keys=keys, batch_hits=hits)
             return hits
 
+    def observe_events(self, events, watermark):
+        """Process one event-time batch against ``watermark``.
+
+        ``events`` is a list of objects with string ``key`` and numeric
+        ``timestamp`` fields; the returned list of strings -- one of
+        ``"admitted"``, ``"duplicate"`` or ``"late"`` per item, in input
+        order -- classifies each event.
+
+        The whole batch runs as one locked, durable transaction: time first
+        advances to ``watermark`` and keys older than the span expire, then
+        the events are processed in input order.  An event whose timestamp
+        is smaller than ``watermark - span`` is ``"late"`` (this beats the
+        duplicate check; the boundary itself stays valid).  A non-late event
+        whose key is retained is a ``"duplicate"`` and refreshes neither its
+        first sighting nor its order; otherwise it is ``"admitted"`` and the
+        key keeps that event's timestamp.  Retained keys stay ordered by
+        first sighting, ties broken by admission order; a full window
+        evicts the current oldest key first, so an evicted key readmitted
+        later in the same batch counts as a fresh admission.
+
+        ``admitted`` grows by the number of admissions; only time-based
+        expiry grows ``expired`` -- late events, duplicates and capacity
+        evictions touch neither counter.  Exactly one commit is added when
+        the watermark advances, an expiry happens or an event is admitted;
+        a batch that does none of that commits nothing.  An empty list
+        still advances the watermark and expires.
+
+        Validation completes before any filesystem access: a wrong type
+        raises ``TypeError`` and a missing field, a non-finite or negative
+        time, a watermark below the current time, an event after the
+        watermark, a corrupt state or a settings mismatch raises
+        ``ValueError``; neither creates the state directory nor changes an
+        existing state file.
+        """
+        if not isinstance(events, list):
+            raise TypeError("events must be a list of event objects")
+        if not _is_number(watermark):
+            raise TypeError("watermark must be an int or float")
+        if not math.isfinite(watermark) or watermark < 0:
+            raise ValueError("watermark must be finite and non-negative")
+        prepared = []
+        for event in events:
+            if not isinstance(event, dict):
+                raise TypeError("each event must be an object with key and timestamp")
+            if "key" not in event or "timestamp" not in event:
+                raise ValueError("each event must carry key and timestamp")
+            key = event["key"]
+            timestamp = event["timestamp"]
+            if not isinstance(key, str):
+                raise TypeError("event key must be a string")
+            if not _is_number(timestamp):
+                raise TypeError("event timestamp must be an int or float")
+            if not math.isfinite(timestamp) or timestamp < 0:
+                raise ValueError("event timestamp must be finite and non-negative")
+            if timestamp > watermark:
+                raise ValueError("event timestamp is later than the watermark")
+            prepared.append((key, timestamp))
+        # Monotonicity against this process's own clock is checkable without
+        # touching the filesystem, so reject it before any directory exists.
+        if watermark < self._clock:
+            raise ValueError("watermark is earlier than the current time")
+        # With no committed state on disk the window starts empty at time 0,
+        # where the only no-op batch is an empty one at watermark 0.  Answer
+        # that without creating the directory; everything else takes the
+        # locked transaction path, which rechecks against the state on disk
+        # (a concurrent process may have created it in the meantime).
+        state_path = os.path.join(self._state_dir, _STATE_FILE)
+        if (
+            self._last_commit is None
+            and not os.path.exists(state_path)
+            and watermark == 0
+            and not prepared
+        ):
+            return []
+        self._ensure_dir()
+        with self._locked(True):
+            self._reload_if_present()
+            if watermark < self._now:
+                # Another process already committed past this watermark; a
+                # regression through shared state is rejected, not contended.
+                raise ValueError("watermark is earlier than the current time")
+            self._clock = watermark
+            moved = watermark != self._now
+            previous_now = self._now
+            self._now = watermark
+            dropped = []
+            while self._entries and watermark - self._entries[0][1] > self._span:
+                key, _ = self._entries.pop(0)
+                del self._index[key]
+                dropped.append(key)
+            self._expired += len(dropped)
+            kinds = []
+            admitted_any = False
+            for key, timestamp in prepared:
+                if watermark - timestamp > self._span:
+                    kinds.append("late")
+                    continue
+                if key in self._index:
+                    kinds.append("duplicate")
+                    continue
+                kinds.append("admitted")
+                admitted_any = True
+                while len(self._entries) >= self._capacity:
+                    oldest, _ = self._entries.pop(0)
+                    del self._index[oldest]
+                pair = [key, timestamp]
+                _insert_by_first(self._entries, pair)
+                self._index[key] = timestamp
+                self._admitted += 1
+            if moved or dropped or admitted_any:
+                self._commit(
+                    "events",
+                    dropped,
+                    [],
+                    event_items=prepared,
+                    event_kinds=kinds,
+                    event_wmark=previous_now,
+                )
+            return kinds
+
     def advance(self, now):
         """Move the current time to ``now`` and drop keys older than the span.
 
@@ -1463,7 +1699,8 @@ class Window:
             os.close(fd)
         return envelope["checksum"], data
 
-    def _commit(self, op, drop, add, batch_keys=(), batch_hits=()):
+    def _commit(self, op, drop, add, batch_keys=(), batch_hits=(),
+                event_items=(), event_kinds=(), event_wmark=None):
         """Commit the in-memory state as the next commit; caller holds lock."""
         self._sweep_temp_files()
         if self._needs_anchor():
@@ -1500,6 +1737,13 @@ class Window:
             # within this same commit.
             body["keys"] = list(batch_keys)
             body["hits"] = list(batch_hits)
+        elif op == "events":
+            # Watermark before the batch plus the inputs (key and timestamp)
+            # and the per-item kinds let replay recompute the post-commit
+            # state, including expiries and intra-batch readmissions.
+            body["wmark"] = event_wmark
+            body["events"] = [[key, timestamp] for key, timestamp in event_items]
+            body["kinds"] = list(event_kinds)
         else:
             body["drop"] = list(drop)
             body["add"] = [list(pair) for pair in add]

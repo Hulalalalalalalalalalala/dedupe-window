@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -15,7 +16,7 @@ DEFAULT_CAPACITY = 1024
 USAGE = (
     "usage: python3 -m dedupe_window --state <dir> "
     "{observe <key> | seen <key> | stats | export <seq> | restore"
-    " | observe-batch}"
+    " | observe-batch | observe-events}"
 )
 
 # A decimal commit number: one or more decimal digits, optionally signed with
@@ -44,6 +45,11 @@ def _batch_failed(reason):
     raise SystemExit(1)
 
 
+def _event_batch_failed(reason):
+    print(f"event batch failed: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
 def _parse(argv):
     state = None
     rest = []
@@ -67,7 +73,7 @@ def _parse(argv):
     if command in ("observe", "seen", "export"):
         if len(operands) != 1:
             _usage()
-    elif command in ("stats", "restore", "observe-batch"):
+    elif command in ("stats", "restore", "observe-batch", "observe-events"):
         if operands:
             _usage()
     else:
@@ -162,6 +168,66 @@ def _run_observe_batch(state):
     sys.stdout.write(json.dumps(hits, separators=(",", ":")) + "\n")
 
 
+def _run_observe_events(state):
+    """Atomically process one event-time batch read from stdin.
+
+    The input is exactly one JSON object holding an ``events`` list and a
+    ``watermark``; extra fields are ignored.  Input types and ranges are
+    validated before any filesystem call, so an invalid input creates no
+    directory and leaves an existing state byte for byte unchanged.  On
+    success stdout holds one compact JSON line of per-item results.  Any
+    failure exits 1 with one ``event batch failed`` line on stderr and an
+    empty stdout.
+    """
+    raw = sys.stdin.buffer.read()
+    try:
+        document = json.loads(raw)
+    except ValueError as exc:
+        # Covers an empty input, malformed JSON and trailing junk.
+        _event_batch_failed(f"input is not one JSON object: {exc}")
+    if not isinstance(document, dict) or "events" not in document \
+            or "watermark" not in document:
+        _event_batch_failed("input must be one JSON object with events and watermark")
+    events = document["events"]
+    watermark = document["watermark"]
+    if not isinstance(events, list):
+        _event_batch_failed("events must be a JSON array")
+    if not isinstance(watermark, (int, float)) or isinstance(watermark, bool):
+        _event_batch_failed("watermark must be an int or float")
+    if not math.isfinite(watermark) or watermark < 0:
+        _event_batch_failed("watermark must be finite and non-negative")
+    prepared = []
+    for event in events:
+        if not isinstance(event, dict) or "key" not in event \
+                or "timestamp" not in event:
+            _event_batch_failed("each event must be an object with key and timestamp")
+        key = event["key"]
+        timestamp = event["timestamp"]
+        if not isinstance(key, str):
+            _event_batch_failed("event key must be a string")
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+            _event_batch_failed("event timestamp must be an int or float")
+        if not math.isfinite(timestamp) or timestamp < 0:
+            _event_batch_failed("event timestamp must be finite and non-negative")
+        if timestamp > watermark:
+            _event_batch_failed("event timestamp is later than the watermark")
+        prepared.append({"key": key, "timestamp": timestamp})
+    # Open with the persisted settings so a settings mismatch cannot arise;
+    # the method itself creates the directory only when the batch actually
+    # has to commit.  Every failure (creating the directory, reading the
+    # data file) is an event batch failure, never the generic corruption text.
+    path = os.path.join(state, "window.json")
+    span, capacity = DEFAULT_SPAN, DEFAULT_CAPACITY
+    try:
+        if os.path.exists(path):
+            span, capacity = read_settings(path)
+        window = Window(state, span, capacity)
+        kinds = window.observe_events(prepared, watermark)
+    except (TypeError, ValueError, OSError) as exc:
+        _event_batch_failed(str(exc))
+    sys.stdout.write(json.dumps(kinds, separators=(",", ":")) + "\n")
+
+
 def _run_restore(state):
     """Reset the state atomically from exactly one JSON object on stdin.
 
@@ -216,6 +282,8 @@ def main(argv=None):
         _run_restore(state)
     elif command == "observe-batch":
         _run_observe_batch(state)
+    elif command == "observe-events":
+        _run_observe_events(state)
     else:
         # Pure read: never create the directory, never touch the data file.
         if not os.path.exists(path):
