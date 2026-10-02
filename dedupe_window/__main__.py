@@ -14,7 +14,7 @@ DEFAULT_CAPACITY = 1024
 
 USAGE = (
     "usage: python3 -m dedupe_window --state <dir> "
-    "{observe <key> | seen <key> | stats | export <seq> | restore}"
+    "{observe <key> | seen <key> | stats | export <seq> | restore | observe-batch}"
 )
 
 # A decimal commit number: one or more decimal digits, optionally signed with
@@ -35,6 +35,11 @@ def _corrupt(reason):
 
 def _restore_failed(reason):
     print(f"restore failed: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _batch_failed(reason):
+    print(f"batch failed: {reason}", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -61,7 +66,7 @@ def _parse(argv):
     if command in ("observe", "seen", "export"):
         if len(operands) != 1:
             _usage()
-    elif command in ("stats", "restore"):
+    elif command in ("stats", "restore", "observe-batch"):
         if operands:
             _usage()
     else:
@@ -149,6 +154,46 @@ def _run_restore(state):
     sys.stdout.write(json.dumps(window.stats(), separators=(",", ":")) + "\n")
 
 
+def _run_observe_batch(state):
+    """Record one JSON array of string keys from stdin as a single batch.
+
+    The whole input is parsed and type-checked before any filesystem call, so
+    empty, malformed or wrongly typed input creates no directory and leaves an
+    existing state file byte-for-byte untouched.  Success writes exactly one
+    compact JSON boolean array, aligned with the input keys, to stdout.  An
+    empty array answers ``[]`` and neither reads nor creates state.
+    """
+    raw = sys.stdin.buffer.read()
+    try:
+        keys = json.loads(raw)
+    except ValueError as exc:
+        # Covers empty input, malformed JSON and trailing non-whitespace;
+        # json.loads itself tolerates surrounding whitespace.
+        _batch_failed(f"input is not one JSON array: {exc}")
+    if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+        _batch_failed("input is not a JSON array of strings")
+    if not keys:
+        sys.stdout.write("[]\n")
+        return
+    path = os.path.join(state, "window.json")
+    span, capacity = DEFAULT_SPAN, DEFAULT_CAPACITY
+    try:
+        span, capacity = read_settings(path)
+    except FileNotFoundError:
+        pass  # fresh state: observe_many starts from the empty window
+    except ValueError as exc:
+        _batch_failed(str(exc))
+    try:
+        window = Window(state, span, capacity)
+        # One locked, durable transaction; observe_many creates the directory.
+        # A corrupt file found on reload, a settings mismatch or a storage
+        # failure all fail the whole batch.
+        results = window.observe_many(keys)
+    except (TypeError, ValueError, OSError) as exc:
+        _batch_failed(str(exc))
+    sys.stdout.write(json.dumps(results, separators=(",", ":")) + "\n")
+
+
 def main(argv=None):
     state, command, operands = _parse(list(sys.argv[1:] if argv is None else argv))
     path = os.path.join(state, "window.json")
@@ -171,6 +216,8 @@ def main(argv=None):
         _run_export(state, int(token))
     elif command == "restore":
         _run_restore(state)
+    elif command == "observe-batch":
+        _run_observe_batch(state)
     else:
         # Pure read: never create the directory, never touch the data file.
         if not os.path.exists(path):

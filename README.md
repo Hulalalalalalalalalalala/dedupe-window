@@ -17,6 +17,21 @@ Python 3.11 or newer. Standard library only.
     python3 -m dedupe_window --state ./window stats
     python3 -m dedupe_window --state ./window export <seq>
     python3 -m dedupe_window --state ./window restore
+    python3 -m dedupe_window --state ./window observe-batch < keys.json
+
+`observe-batch` takes no operand; it reads one JSON array of strings from
+standard input (surrounding whitespace is allowed) and prints one compact JSON
+array of booleans aligned item by item with the input. The whole array is one
+atomic transaction: every admission is stamped with the single current time at
+batch start, time never advances, repeats neither refresh time nor order, and a
+full window evicts the oldest key, so a key evicted earlier in the same batch
+is admitted again if it reappears. An accepting batch adds exactly one commit
+(the `admitted` count rises by the number of `true`s; capacity eviction does
+not raise `expired`); an all-duplicate batch commits nothing; `[]` prints `[]`
+and neither reads nor creates state. Exit 0 prints the boolean line; empty
+input, malformed JSON, a non-array, a non-string element or trailing
+non-whitespace exits 1 with an empty stdout and one `batch failed` line on
+stderr, leaving the state (and a missing directory) untouched.
 
 `export <seq>` writes the complete self-checking document of commit `seq`
 (numbered from 1) as one JSON object on standard output, without changing the
@@ -34,6 +49,9 @@ A bad command line exits 2 with a usage message. `export` exits 1 with a
 the commit number is non-positive or unknown; `restore` exits 1 with a
 `restore failed` message for anything that is not one valid checkpoint
 document, and never creates or partly modifies the state in that case.
+`observe-batch` exits 1 with a `batch failed` message for empty input, invalid
+JSON, a non-string-array, trailing non-whitespace, or a missing/corrupt state
+or storage failure, likewise without creating or partly modifying the state.
 
 ## Public interface
 
@@ -42,6 +60,7 @@ Constructing a `Window` never creates the directory or the data file; only a
 mutation (`observe`/`advance`/`restore`) does. Read-only calls on a window that
 has never committed answer from the empty state and leave the filesystem alone.
 - `observe(key) -> bool` records a sighting and returns whether the key was newly admitted.
+- `observe_many(keys) -> list[bool]` records a list of string keys as one atomic batch, returning a boolean per key in input order. It stamps admissions with the single current time at batch start (never advancing time), keeps a repeat's original time and order, evicts the oldest retained key when full (so a key evicted within the batch can be re-admitted), and raises `admitted` by the number of `true`s without touching `expired`. An accepting batch adds exactly one commit; an all-duplicate batch commits nothing; `[]` returns `[]` without reading or creating state. A non-list or any non-string element raises `TypeError` before the filesystem is touched; corrupt state or a settings mismatch raises `ValueError` without overwriting it.
 - `seen(key) -> bool` reports membership without recording anything.
 - `advance(now) -> int` drops everything older than the span and returns how many keys went.
 - `keys() -> list[str]` retained keys, oldest sighting first.

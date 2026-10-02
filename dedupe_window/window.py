@@ -12,9 +12,9 @@ Persistence is crash safe and versioned.  The state directory holds exactly
 one data file, ``window.json``, in a log-structured format: a checksummed
 base snapshot followed by checksummed records, one per line, chained by
 sequence number and the previous record's checksum.  Most records are small
-delta segments, one per committed mutation, so the bytes hitting disk stay
-proportional to the change instead of mirroring the whole retained state
-every time.  Periodically a compaction appends an *anchor*: a full snapshot
+delta segments, one per committed mutation -- a multi-key batch counts as a
+single mutation -- so the bytes hitting disk stay proportional to the change
+instead of mirroring the whole retained state every time.  Periodically a compaction appends an *anchor*: a full snapshot
 of one commit.  Unlike a rewrite, appending an anchor leaves every earlier
 record in place, so each commit keeps the number it arrived with and stays
 locatable: an export returns the same document whether it runs before or
@@ -493,11 +493,21 @@ def _apply_v3_delta(line, state, index, max_first):
     if body["prev"] != state["tip"]:
         raise ValueError("state file segment chain is broken")
     op = body["op"]
-    if op not in ("admit", "sweep"):
+    if op not in ("admit", "sweep", "batch"):
+        raise ValueError("state file holds a malformed segment")
+    if op == "batch":
+        gained = body.get("gained")
+        if not _is_count(gained):
+            raise ValueError("state file segment has an invalid batch gain")
+    elif "gained" in body:
         raise ValueError("state file holds a malformed segment")
     new_now = body["now"]
     if not _is_number(new_now) or new_now < state["now"]:
         raise ValueError("state file segment moves time backwards")
+    if op == "batch" and new_now != state["now"]:
+        # A batch stamps its admissions with the batch-start time and never
+        # advances the clock on its own.
+        raise ValueError("state file batch segment moves time")
     new_admitted = body["admitted"]
     new_expired = body["expired"]
     if not _is_count(new_admitted) or not _is_count(new_expired):
@@ -505,14 +515,24 @@ def _apply_v3_delta(line, state, index, max_first):
     drops = body["drop"]
     if not isinstance(drops, list) or not all(isinstance(key, str) for key in drops):
         raise ValueError("state file segment holds malformed evictions")
+    if len(drops) != len(set(drops)):
+        raise ValueError("state file segment holds malformed evictions")
     raw_adds = body["add"]
     if not isinstance(raw_adds, list):
         raise ValueError("state file segment holds a malformed key entry")
     entries = state["entries"]
+    if len(drops) > len(entries) or [key for key, _ in entries[:len(drops)]] != drops:
+        raise ValueError("state file segment evictions do not match the key order")
+    # A batch may re-admit a start key its own capacity eviction removed;
+    # membership is therefore judged after the drops.  Every other segment
+    # keeps pre-drop membership (its drops can never come back in ``add``).
+    retained_index = set(index)
+    if op == "batch":
+        retained_index.difference_update(drops)
     adds = []
     for item in raw_adds:
         key, first = _check_entry(item, "state file segment")
-        if key in index:
+        if key in retained_index:
             raise ValueError("state file segment admits a duplicate key")
         if first < 0 or first > new_now:
             raise ValueError("state file segment holds a sighting outside the timeline")
@@ -520,15 +540,27 @@ def _apply_v3_delta(line, state, index, max_first):
             raise ValueError("state file segment holds a key older than the span")
         if first < max_first:
             raise ValueError("state file segment keys are not ordered by first sighting")
+        if op == "batch" and first != new_now:
+            raise ValueError("state file segment keys are not stamped with batch time")
+        retained_index.add(key)
         adds.append([key, first])
-    if len(drops) > len(entries) or [key for key, _ in entries[:len(drops)]] != drops:
-        raise ValueError("state file segment evictions do not match the key order")
     if op == "admit":
         if new_admitted != state["admitted"] + len(adds) or new_expired != state["expired"]:
             raise ValueError("state file segment counts are inconsistent")
-    else:
+    elif op == "sweep":
         if adds or new_admitted != state["admitted"] or new_expired != state["expired"] + len(drops):
             raise ValueError("state file segment counts are inconsistent")
+    else:
+        # Admissions churned out again before the batch ends count in gained
+        # but neither appear in adds nor free a retained slot at the end.
+        if gained < len(adds) or gained == 0:
+            raise ValueError("state file segment counts are inconsistent")
+        if new_admitted != state["admitted"] + gained:
+            raise ValueError("state file segment counts are inconsistent")
+        if new_expired != state["expired"]:
+            raise ValueError("state file segment counts are inconsistent")
+        if len(entries) - len(drops) + len(adds) > state["capacity"]:
+            raise ValueError("state file holds more keys than the capacity allows")
     if drops:
         del entries[:len(drops)]
         for key in drops:
@@ -949,7 +981,6 @@ class Window:
             if admitted:
                 self._commit("admit", drop=evicted, add=[[key, self._now]])
             return admitted
-
     def _admit(self, key):
         """Update memory for one sighting; return (admitted, evicted keys)."""
         if key in self._index:
@@ -963,6 +994,79 @@ class Window:
         self._index[key] = self._now
         self._admitted += 1
         return True, evicted
+
+    def observe_many(self, keys):
+        """Record a batch of sightings as one atomic transaction.
+
+        ``keys`` must be a list of strings; the returned list of booleans
+        lines up with it item by item and applies :meth:`observe` semantics in
+        input order.  Every admission in the batch is stamped with the single
+        current time of the latest committed state seen at batch start; time
+        never advances on its own.  A repeated key neither refreshes its time
+        nor its order, and when the window is full the oldest retained key is
+        evicted, so a key evicted earlier in the same batch is admitted again
+        when it reappears.
+
+        The whole batch is one locked, durable transaction: readers can only
+        ever see the state before the batch or the state after it, never an
+        in-between.  A batch with at least one admission adds exactly one
+        commit; an all-duplicate batch commits nothing; an empty list returns
+        ``[]`` without reading or creating any state.  Type validation happens
+        before the filesystem is touched.
+        """
+        if not isinstance(keys, list):
+            raise TypeError("keys must be a list of strings")
+        for key in keys:
+            if not isinstance(key, str):
+                raise TypeError("keys must be a list of strings")
+        if not keys:
+            return []
+        self._ensure_dir()
+        with self._locked(True):
+            self._reload_if_present()
+            results, evicted, added, gained = self._admit_many(keys)
+            if gained:
+                self._commit("batch", drop=evicted, add=added, gained=gained)
+            return results
+
+    def _admit_many(self, keys):
+        """Apply one batch in memory at the current time; caller holds lock.
+
+        Returns ``(results, evicted, added, gained)``: the per-item booleans,
+        the keys retained at batch start that capacity eviction removed (in
+        eviction order), the ``[key, first_seen]`` pairs newly retained at
+        batch end in key order, and the number of admissions.  A key admitted
+        during the batch and evicted again before the end is pure churn: it is
+        absent from both ``evicted`` and ``added`` but still counts in
+        ``gained`` and in ``admitted``.
+        """
+        started = set(self._index)
+        admitted_keys = set()
+        evicted = []
+        results = []
+        for key in keys:
+            if key in self._index:
+                results.append(False)
+                continue
+            results.append(True)
+            admitted_keys.add(key)
+            if len(self._entries) >= self._capacity:
+                oldest, _ = self._entries.pop(0)
+                del self._index[oldest]
+                if oldest in started:
+                    # Count each batch-start key at most once: a start key
+                    # that comes back and is evicted again is pure churn.
+                    evicted.append(oldest)
+                    started.discard(oldest)
+            self._entries.append([key, self._now])
+            self._index[key] = self._now
+            self._admitted += 1
+        added = [
+            [key, first]
+            for key, first in self._entries
+            if key in admitted_keys
+        ]
+        return results, evicted, added, sum(results)
 
     def advance(self, now):
         """Move the current time to ``now`` and drop keys older than the span.
@@ -1344,8 +1448,14 @@ class Window:
             os.close(fd)
         return envelope["checksum"], data
 
-    def _commit(self, op, drop, add):
-        """Commit the in-memory state as the next commit; caller holds lock."""
+    def _commit(self, op, drop, add, gained=None):
+        """Commit the in-memory state as the next commit; caller holds lock.
+
+        ``gained`` is the admission count of a batch transaction: admissions
+        during the batch that were evicted again before it ended count in it
+        even though they are absent from ``add``.  For ``admit`` segments the
+        gain is simply the number of added pairs.
+        """
         self._sweep_temp_files()
         if self._needs_anchor():
             if not self._file_present or self._loaded_version != _VERSION:
@@ -1377,6 +1487,10 @@ class Window:
             "drop": list(drop),
             "add": [list(pair) for pair in add],
         }
+        if op == "batch":
+            # Batch admissions need not equal the retained net adds: a key can
+            # be admitted and capacity-evicted again within the same batch.
+            body["gained"] = gained
         checksum, data = self._append_record(body)
         self._seq += 1
         self._last_commit = checksum

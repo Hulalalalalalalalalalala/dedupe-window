@@ -1158,5 +1158,248 @@ class CliExportRestoreTests(unittest.TestCase):
         self.assertEqual(listing, ["window.json"])
 
 
+class ObserveBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_spec_example(self):
+        window = Window(self.dir, 100, 2)
+        window.observe("a")
+        results = window.observe_many(["b", "b", "c", "a"])
+        self.assertEqual(results, [True, False, True, True])
+        self.assertEqual(window.keys(), ["c", "a"])
+        stats = window.stats()
+        self.assertEqual(stats["admitted"], 4)   # a + b + c + re-admitted a
+        self.assertEqual(stats["expired"], 0)
+        self.assertEqual(stats["retained"], 2)
+
+    def test_results_align_with_input_order(self):
+        window = Window(self.dir, 100000, 10)
+        window.observe("seen")
+        self.assertEqual(
+            window.observe_many(["x", "seen", "y", "x", "z"]),
+            [True, False, True, False, True],
+        )
+        self.assertEqual(window.keys(), ["seen", "x", "y", "z"])
+
+    def test_empty_batch_returns_empty_without_filesystem(self):
+        state = os.path.join(self.dir, "missing", "window")
+        window = Window(state, 10, 3)
+        self.assertEqual(window.observe_many([]), [])
+        self.assertFalse(os.path.exists(state))
+        self.assertEqual(window._seq, 0)
+
+    def test_non_list_raises_type_error_without_creating_state(self):
+        state = os.path.join(self.dir, "window")
+        window = Window(state, 10, 3)
+        for bad in (("a",), "ab", None, 1, True, {"a": 1}):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                window.observe_many(bad)
+        self.assertFalse(os.path.exists(state))
+
+    def test_non_string_element_raises_type_error(self):
+        window = Window(self.dir, 10, 3)
+        for bad in (["a", 1], [None], [True], [1.0], [["a"]], [{"a": 1}]):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                window.observe_many(bad)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "window.json")))
+
+    def test_batch_uses_batch_start_time_without_advancing(self):
+        window = Window(self.dir, 100, 10)
+        window.advance(8)
+        self.assertEqual(window.observe_many(["b", "c"]), [True, True])
+        snapshot = window.export(window._seq)
+        self.assertEqual(snapshot["now"], 8)
+        self.assertEqual(snapshot["keys"], [["b", 8], ["c", 8]])
+
+    def test_duplicate_in_batch_does_not_refresh_time_or_order(self):
+        window = Window(self.dir, 10, 3)
+        window.observe("a")
+        window.advance(5)
+        window.observe("b")
+        self.assertEqual(window.observe_many(["a", "c"]), [False, True])
+        self.assertEqual(window.keys(), ["a", "b", "c"])
+        self.assertEqual(window.advance(11), 1)  # "a" still expires from time 0
+        self.assertEqual(window.keys(), ["b", "c"])
+
+    def test_accepting_batch_adds_exactly_one_commit(self):
+        window = Window(self.dir, 100000, 100000)
+        window.observe("a")
+        seq = window._seq
+        window.observe_many(["b", "c", "d", "b"])
+        self.assertEqual(window._seq, seq + 1)
+
+    def test_all_duplicate_batch_commits_nothing(self):
+        window = Window(self.dir, 10, 5)
+        window.observe("a")
+        window.observe("b")
+        seq = window._seq
+        self.assertEqual(window.observe_many(["a", "b", "a"]),
+                         [False, False, False])
+        self.assertEqual(window._seq, seq)
+
+    def test_evicted_in_batch_can_be_readmitted(self):
+        window = Window(self.dir, 100, 2)
+        window.observe("a")
+        # b fills the window; c evicts a; a comes back and is admitted again.
+        self.assertEqual(window.observe_many(["b", "c", "a"]),
+                         [True, True, True])
+        self.assertEqual(window.keys(), ["c", "a"])
+
+    def test_intra_batch_churn_counts_every_admission(self):
+        window = Window(self.dir, 100, 2)
+        window.observe("a")
+        # b: (a,b); c evicts a -> (b,c); d evicts b -> (c,d); b re-admitted.
+        self.assertEqual(window.observe_many(["b", "c", "d", "b"]),
+                         [True, True, True, True])
+        self.assertEqual(window.keys(), ["d", "b"])
+        self.assertEqual(window.stats()["admitted"], 5)
+        self.assertEqual(window.stats()["expired"], 0)
+
+    def test_batch_persists_and_reopens(self):
+        window = Window(self.dir, 100, 4)
+        window.observe_many(["a", "b", "a", "c"])
+        clone = Window(self.dir, 100, 4)
+        clone.load()
+        self.assertEqual(clone.keys(), ["a", "b", "c"])
+        self.assertEqual(clone.stats(), window.stats())
+
+    def test_batch_segment_is_one_delta_with_gained(self):
+        path = os.path.join(self.dir, "window.json")
+        window = Window(self.dir, 100, 2)
+        window.observe("a")
+        window.observe_many(["b", "c", "b"])
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        segment = json.loads(lines[-1])
+        self.assertEqual((segment["kind"], segment["op"]), ("delta", "batch"))
+        self.assertEqual(segment["gained"], 2)  # b and c admitted; b repeat false
+
+    def test_corrupt_state_makes_batch_fail_without_overwriting(self):
+        os.makedirs(self.dir, exist_ok=True)
+        path = os.path.join(self.dir, "window.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{broken")
+        with open(path, "rb") as fh:
+            before = fh.read()
+        with self.assertRaises(ValueError):
+            Window(self.dir, 60, 1024).observe_many(["a"])
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_settings_mismatch_makes_batch_fail(self):
+        Window(self.dir, 10, 3).observe("z")
+        with self.assertRaises(ValueError):
+            Window(self.dir, 99, 3).observe_many(["a"])
+
+    def test_restore_then_batch_continues_numbering(self):
+        source = Window(tempfile.mkdtemp(), 100, 10)
+        source.observe("a")
+        source.observe_many(["b", "c"])
+        doc = source.export(source._seq)
+        target = Window(self.dir, 1, 1)
+        target.restore(doc)
+        target.observe_many(["d"])
+        self.assertEqual(target.export(doc["seq"] + 1)["seq"], doc["seq"] + 1)
+        self.assertEqual(target.export(doc["seq"]), doc)
+
+
+class ObserveBatchCliTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def run_cli(self, *args, stdin=None):
+        return subprocess.run(
+            [sys.executable, "-m", "dedupe_window", *args],
+            capture_output=True, text=True, input=stdin,
+        )
+
+    def test_success_writes_one_compact_boolean_array(self):
+        state = os.path.join(self.dir, "w")
+        result = self.run_cli("--state", state, "observe-batch",
+                              stdin=json.dumps(["b", "b", "c", "a"]))
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "[true,false,true,true]\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_surrounding_whitespace_is_allowed(self):
+        state = os.path.join(self.dir, "w")
+        result = self.run_cli("--state", state, "observe-batch",
+                              stdin='  \n\t' + json.dumps(["a"]) + '\n  \t')
+        self.assertEqual((result.returncode, result.stdout), (0, "[true]\n"))
+
+    def test_empty_array_is_success_and_creates_nothing(self):
+        for payload in ("[]", "  [ ]  \n"):
+            state = os.path.join(self.dir, "never-" + str(len(payload)))
+            result = self.run_cli("--state", state, "observe-batch", stdin=payload)
+            self.assertEqual((result.returncode, result.stdout), (0, "[]\n"))
+            self.assertFalse(os.path.exists(state))
+
+    def test_bad_inputs_exit_1_change_nothing(self):
+        cases = {
+            "empty": "",
+            "whitespace": "  \n\t",
+            "not json": "{nope",
+            "object": "{}",
+            "string": json.dumps("ab"),
+            "number": "42",
+            "int element": json.dumps(["a", 1]),
+            "null element": json.dumps([None]),
+            "bool element": json.dumps([True]),
+            "nested": json.dumps([["a"]]),
+            "two arrays": json.dumps(["a"]) + json.dumps(["b"]),
+            "trailing junk": json.dumps(["a"]) + "x",
+        }
+        for name, payload in cases.items():
+            state = os.path.join(self.dir, "case-" + name.replace(" ", "-"))
+            result = self.run_cli("--state", state, "observe-batch", stdin=payload)
+            self.assertEqual(result.returncode, 1, name)
+            self.assertEqual(result.stdout, "", name)
+            self.assertTrue(result.stderr.startswith("batch failed"), name)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, name)
+            self.assertFalse(os.path.exists(state), name)
+
+    def test_usage_error_exits_2(self):
+        state = os.path.join(self.dir, "w")
+        result = self.run_cli("--state", state, "observe-batch", "extra")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage", result.stderr.lower())
+
+    def test_corrupt_state_exits_1_and_is_untouched(self):
+        state = os.path.join(self.dir, "broken")
+        os.makedirs(state)
+        path = os.path.join(state, "window.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{broken")
+        with open(path, "rb") as fh:
+            before = fh.read()
+        result = self.run_cli("--state", state, "observe-batch",
+                              stdin=json.dumps(["a"]))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith("batch failed"))
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_batches_persist_between_invocations(self):
+        state = os.path.join(self.dir, "w")
+        first = self.run_cli("--state", state, "observe-batch",
+                             stdin=json.dumps(["b", "b", "c", "a"]))
+        self.assertEqual(first.returncode, 0)
+        second = self.run_cli("--state", state, "observe-batch",
+                              stdin=json.dumps(["a", "z"]))
+        self.assertEqual(second.stdout, "[false,true]\n")
+        stats = self.run_cli("--state", state, "stats")
+        self.assertEqual(
+            json.loads(stats.stdout),
+            {"span": 60, "capacity": 1024, "retained": 4,
+             "admitted": 4, "expired": 0},
+        )
+        exported = self.run_cli("--state", state, "export", "2")
+        self.assertEqual(exported.returncode, 0)
+        self.assertEqual([k for k, _ in json.loads(exported.stdout)["keys"]],
+                         ["b", "c", "a", "z"])
+
+
 if __name__ == "__main__":
     unittest.main()
