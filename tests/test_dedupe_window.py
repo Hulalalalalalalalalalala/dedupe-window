@@ -2096,5 +2096,313 @@ class CliObserveEventsTests(unittest.TestCase):
         self.assertIn("usage", result.stderr.lower())
 
 
+class DeliverEventsTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def window(self, span=100000, capacity=10):
+        return Window(self.dir, span, capacity)
+
+    def _ev(self, *pairs):
+        return [{"key": k, "timestamp": t} for k, t in pairs]
+
+    def test_first_delivery_matches_observe_events_classification(self):
+        window = self.window()
+        events = self._ev(("a", 0), ("b", 5), ("a", 2), ("c", 5))
+        self.assertEqual(
+            window.deliver_events("id1", events, 10),
+            ["admitted", "admitted", "duplicate", "admitted"],
+        )
+
+    def test_replay_after_expiry_and_eviction_returns_original(self):
+        window = self.window(span=10, capacity=10)
+        events = self._ev(("a", 0), ("b", 5))
+        original = window.deliver_events("id1", events, 5)
+        # Expire "a", so a fresh observe_events would now re-admit it.
+        window.observe_events([], 11)
+        self.assertEqual(window.keys(), ["b"])
+        self.assertEqual(window.deliver_events("id1", events, 5), original)
+        # Capacity-evicted path: force "b" out through a tight window, then
+        # replay must still report the original "admitted" for it.
+        tight = Window(tempfile.mkdtemp(), 100000, 1)
+        ev = self._ev(("x", 0), ("y", 1))
+        first = tight.deliver_events("d", ev, 1)
+        self.assertEqual(first, ["admitted", "admitted"])
+        self.assertEqual(tight.keys(), ["y"])  # "x" capacity-evicted
+        self.assertEqual(tight.deliver_events("d", ev, 1), first)
+
+    def test_replay_changes_nothing_and_succeeds_with_lagging_watermark(self):
+        window = self.window(span=10, capacity=10)
+        events = self._ev(("a", 0))
+        self.assertEqual(window.deliver_events("id", events, 0), ["admitted"])
+        window.observe_events([], 20)
+        path = os.path.join(self.dir, "window.json")
+        before = open(path, "rb").read()
+        stats_before = window.stats()
+        seq_before = window._seq
+        self.assertEqual(window.deliver_events("id", events, 0), ["admitted"])
+        self.assertEqual(window._seq, seq_before)
+        self.assertEqual(window.stats(), stats_before)
+        self.assertEqual(open(path, "rb").read(), before)
+
+    def test_content_conflict_raises_value_error(self):
+        window = self.window()
+        events = self._ev(("a", 0), ("b", 1))
+        window.deliver_events("id", events, 5)
+        with self.assertRaises(ValueError):
+            window.deliver_events("id", self._ev(("a", 0)), 5)
+        with self.assertRaises(ValueError):
+            window.deliver_events("id", events, 4)
+        with self.assertRaises(ValueError):
+            window.deliver_events("id", self._ev(("a", 0), ("x", 1)), 5)
+
+    def test_extra_fields_ignored_and_int_float_equivalent(self):
+        window = self.window()
+        events = [{"key": "a", "timestamp": 2.0, "note": 1}]
+        self.assertEqual(window.deliver_events("id", events, 5.0), ["admitted"])
+        self.assertEqual(
+            window.deliver_events("id", [{"key": "a", "timestamp": 2}], 5),
+            ["admitted"],
+        )
+
+    def test_delivery_id_validation(self):
+        window = self.window()
+        for bad in (None, 1, 1.5, True, [], {}):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                window.deliver_events(bad, [], 0)
+        with self.assertRaises(ValueError):
+            window.deliver_events("", [], 0)
+
+    def test_other_input_errors_match_observe_events(self):
+        window = self.window()
+        with self.assertRaises(TypeError):
+            window.deliver_events("id", "nope", 0)
+        with self.assertRaises(ValueError):
+            window.deliver_events("id", [], -1)
+        with self.assertRaises(ValueError):
+            window.deliver_events("id", self._ev(("a", 1)), 0)
+
+    def test_empty_and_all_duplicate_batches_commit(self):
+        window = self.window()
+        window.deliver_events("empty", [], 0)
+        self.assertEqual(window._seq, 1)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.dir, "window.json"))
+        )
+        before = window._seq
+        window.deliver_events("dup", self._ev(("a", 0)), 0)
+        window.deliver_events("dup2", self._ev(("a", 0)), 0)
+        self.assertEqual(window._seq, before + 2)
+        # A replay, by contrast, adds nothing.
+        seq = window._seq
+        window.deliver_events("dup2", self._ev(("a", 0)), 0)
+        self.assertEqual(window._seq, seq)
+
+    def test_ring_eviction_is_fifo_and_replay_does_not_refresh(self):
+        import dedupe_window.window as mod
+        window = self.window()
+        with mock.patch.object(mod, "_RECEIPT_LIMIT", 4):
+            for i in range(4):
+                window.deliver_events(f"r{i}", self._ev((f"k{i}", 0)), 0)
+            # Touching r0 must not move it to the back.
+            window.deliver_events("r0", self._ev(("k0", 0)), 0)
+            window.deliver_events("r4", self._ev(("k4", 0)), 0)
+            # r0 is evicted despite the recent replay; r1 is still live and
+            # replays its original result.
+            self.assertEqual(
+                window.deliver_events("r1", self._ev(("k1", 0)), 0),
+                ["admitted"],
+            )
+            # Re-delivering the evicted r0 is a brand new request: it
+            # re-classifies the still-retained key as a duplicate (and pushes
+            # r1 out of the ring in its turn).
+            self.assertEqual(
+                window.deliver_events("r0", self._ev(("k0", 0)), 0),
+                ["duplicate"],
+            )
+            self.assertEqual(
+                window.deliver_events("r1", self._ev(("k1", 0)), 0),
+                ["duplicate"],
+            )
+
+    def test_evicted_identifier_is_a_new_request_that_must_not_regress(self):
+        import dedupe_window.window as mod
+        window = self.window()
+        with mock.patch.object(mod, "_RECEIPT_LIMIT", 1):
+            window.deliver_events("only", self._ev(("a", 0)), 0)
+            window.deliver_events("next", self._ev(("b", 0)), 5)
+            with self.assertRaises(ValueError):
+                window.deliver_events("only", self._ev(("a", 0)), 0)
+
+    def test_receipts_survive_restart_and_compaction(self):
+        import dedupe_window.window as mod
+        window = self.window()
+        events = self._ev(("a", 1))
+        with mock.patch.object(mod, "_MAX_DELTAS", 4), \
+                mock.patch.object(mod, "_MIN_ANCHOR_BYTES", 64):
+            window.deliver_events("keep", events, 1)
+            for i in range(2, 20):
+                window.deliver_events(f"d{i}", self._ev((f"k{i}", i)), i)
+            clone = Window(self.dir, 100000, 10)
+            clone.load()
+            self.assertEqual(clone.deliver_events("keep", events, 1), ["admitted"])
+
+    def test_export_and_restore_preserve_receipts_and_conflict(self):
+        window = self.window()
+        events = self._ev(("a", 0), ("b", 1))
+        window.deliver_events("id", events, 5)
+        doc = window.export(window._seq)
+        self.assertIn("receipts", doc)
+        self.assertTrue(any(e[0] == "id" for e in doc["receipts"]))
+        target = Window(tempfile.mkdtemp(), 10, 3)
+        target.restore(doc)
+        self.assertEqual(target.deliver_events("id", events, 5),
+                         ["admitted", "admitted"])
+        with self.assertRaises(ValueError):
+            target.deliver_events("id", self._ev(("a", 0)), 5)
+
+    def test_old_export_restores_with_no_receipts(self):
+        import hashlib as _hashlib
+        window = self.window()
+        window.deliver_events("id", self._ev(("a", 0)), 0)
+        doc = window.export(window._seq)
+        old = {k: v for k, v in doc.items() if k != "receipts"}
+        body = {k: v for k, v in old.items() if k != "checksum"}
+        old["checksum"] = _hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        target = Window(tempfile.mkdtemp(), 10, 3)
+        target.restore(old)  # no error: receipts treated as absent
+        self.assertEqual(
+            target.deliver_events("id", self._ev(("a", 0)), 0), ["duplicate"]
+        )
+
+    def test_tampered_delivery_segment_is_detected_on_load(self):
+        window = self.window()
+        window.observe("seed")
+        window.deliver_events("id", self._ev(("a", 0)), 0)
+        path = os.path.join(self.dir, "window.json")
+        lines = open(path, encoding="utf-8").read().splitlines()
+        segment = json.loads(lines[-1])
+        segment["kinds"] = ["duplicate"]
+        lines[-1] = json.dumps(segment, sort_keys=True, separators=(",", ":"))
+        tampered = json.loads(lines[-1])
+        lines[-1] = json.dumps(
+            {**tampered, "checksum": _export_checksum(tampered)},
+            sort_keys=True, separators=(",", ":"),
+        )
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + '\n{"kind":"delta",')
+        with self.assertRaises(ValueError):
+            Window(self.dir, 100000, 10).load()
+
+
+class CliDeliverEventsTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def run_cli(self, payload, state=None):
+        state = state or os.path.join(self.dir, "window")
+        return subprocess.run(
+            [sys.executable, "-m", "dedupe_window", "--state", state,
+             "deliver-events"],
+            capture_output=True, text=True, input=payload,
+        )
+
+    def test_deliver_flow_and_replay(self):
+        state = os.path.join(self.dir, "window")
+        payload = json.dumps({"delivery_id": "d1",
+                              "events": [{"key": "a", "timestamp": 0}],
+                              "watermark": 0})
+        first = self.run_cli(payload, state)
+        self.assertEqual((first.returncode, first.stdout), (0, '["admitted"]\n'))
+        again = self.run_cli(payload, state)
+        self.assertEqual((again.returncode, again.stdout), (0, '["admitted"]\n'))
+
+    def test_empty_batch_commits_and_outputs_empty_list(self):
+        state = os.path.join(self.dir, "window")
+        result = self.run_cli(
+            json.dumps({"delivery_id": "d", "events": [], "watermark": 5}), state
+        )
+        self.assertEqual((result.returncode, result.stdout), (0, "[]\n"))
+        self.assertTrue(os.path.exists(os.path.join(state, "window.json")))
+
+    def test_failures_exit_1_with_delivery_failed(self):
+        cases = {
+            "empty": "",
+            "not json": "{x",
+            "json array": json.dumps([]),
+            "missing id": json.dumps({"events": [], "watermark": 0}),
+            "missing events": json.dumps({"delivery_id": "x", "watermark": 0}),
+            "missing watermark": json.dumps({"delivery_id": "x", "events": []}),
+            "non-string id": json.dumps(
+                {"delivery_id": 1, "events": [], "watermark": 0}),
+            "empty id": json.dumps(
+                {"delivery_id": "", "events": [], "watermark": 0}),
+            "bad watermark": json.dumps(
+                {"delivery_id": "x", "events": [], "watermark": -1}),
+            "future event": json.dumps({"delivery_id": "x",
+                                        "events": [{"key": "a", "timestamp": 9}],
+                                        "watermark": 0}),
+            "two objects": '{"delivery_id":"x","events":[],"watermark":0}' * 2,
+        }
+        for name, payload in cases.items():
+            state = os.path.join(self.dir, "c_" + name.replace(" ", "_"))
+            result = self.run_cli(payload, state)
+            self.assertEqual(result.returncode, 1, name)
+            self.assertEqual(result.stdout, "", name)
+            self.assertTrue(result.stderr.startswith("delivery failed"), name)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, name)
+            self.assertFalse(os.path.exists(state), name)
+
+    def test_conflict_exits_1(self):
+        state = os.path.join(self.dir, "window")
+        self.run_cli(json.dumps({"delivery_id": "d",
+                                 "events": [{"key": "a", "timestamp": 0}],
+                                 "watermark": 0}), state)
+        result = self.run_cli(json.dumps({"delivery_id": "d",
+                                          "events": [{"key": "b", "timestamp": 0}],
+                                          "watermark": 0}), state)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith("delivery failed"))
+
+    def test_operand_is_a_usage_error_exit_2(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", os.path.join(self.dir, "w"), "deliver-events", "x"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("usage", result.stderr.lower())
+
+    def test_concurrent_identical_deliveries_commit_once(self):
+        state = os.path.join(self.dir, "mp")
+        script = textwrap.dedent("""
+            import json, sys
+            from dedupe_window import Window
+            w = Window(sys.argv[1], 100000, 1000)
+            print(json.dumps(w.deliver_events(
+                "same", [{"key": "a", "timestamp": 0},
+                         {"key": "b", "timestamp": 1}], 5)))
+        """)
+        env = dict(os.environ,
+                   PYTHONPATH=_REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
+        procs = [
+            subprocess.Popen([sys.executable, "-c", script, state], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for _ in range(6)
+        ]
+        outs = [p.communicate() for p in procs]
+        self.assertEqual([p.returncode for p in procs], [0] * 6)
+        self.assertEqual({o[0].decode().strip() for o in outs},
+                         {json.dumps(["admitted", "admitted"])})
+        window = Window(state, 100000, 1000)
+        window.load()
+        self.assertEqual(window.stats()["admitted"], 2)
+        self.assertEqual(window._seq, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

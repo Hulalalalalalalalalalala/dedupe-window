@@ -19,6 +19,7 @@ Python 3.11 or newer. Standard library only.
     python3 -m dedupe_window --state ./window restore
     python3 -m dedupe_window --state ./window observe-batch
     python3 -m dedupe_window --state ./window observe-events
+    python3 -m dedupe_window --state ./window deliver-events
 
 `observe-batch` reads one JSON array of strings from standard input (surrounding
 whitespace is allowed) and writes one compact JSON line of booleans, one per
@@ -59,6 +60,40 @@ with one `event batch failed` line on standard error and an empty standard
 output, leaving the state and directory untouched; a wrong number of command
 arguments exits 2 with the usage message.
 
+output, leaving the state and directory untouched; a wrong number of command
+arguments exits 2 with the usage message.
+
+`deliver-events` adds batch-level idempotent delivery on top of the
+`observe-events` semantics. It reads one JSON object from standard input, e.g.
+`{"delivery_id":"batch-7","events":[{"key":"a","timestamp":12}],"watermark":20}`
+(extra fields are ignored), and writes one compact JSON line of the same three
+classifications in input order. The first delivery of a `delivery_id` behaves
+exactly like `observe-events` -- same classification, eviction and counter
+semantics -- with the event changes and the delivery receipt committed
+together in one commit; unlike `observe-events`, an empty batch and an
+all-duplicate batch also commit, so the receipt is durable. The most recent
+128 distinct identifiers are remembered in first successful commit order (the
+oldest is evicted past that limit; a replay never refreshes an entry's
+position, and neither time advancement nor key expiry evicts a receipt). A
+retained identifier replays the original classifications -- returning the
+original result even when its keys have since expired or been evicted -- only
+when the watermark and the ordered `key`/`timestamp` contents match (extra
+event fields are ignored; an int and a float compare equal when numerically
+equal). A replay changes neither the time, the counters nor the file and still
+succeeds when its watermark now lags the current time; a content mismatch
+exits 1. Once an identifier has been evicted it is treated as a brand new
+request, for which a watermark behind the current time is a regression and
+exits 1. Identifiers are compared as raw strings; a non-string `delivery_id`
+exits 1 as a validation error and an empty string exits 1 as well. Receipts
+persist in `window.json` (so replays survive a restart), survive `export` and
+`restore` (they are covered by the export checksum; old exports without
+receipts restore with none), and several processes delivering the same
+identifier and contents commit exactly once and all receive the same result.
+Bad JSON, a missing field, a validation error, a content conflict, corrupt
+state or an I/O failure exits 1 with one `delivery failed` line on standard
+error and an empty standard output; a wrong number of command arguments exits
+2 with the usage message.
+
 `export <seq>` writes the complete self-checking document of commit `seq`
 (numbered from 1) as one JSON object on standard output, without changing the
 state. `restore` reads exactly one such document from standard input and
@@ -80,11 +115,12 @@ document, and never creates or partly modifies the state in that case.
 
 `dedupe_window.Window(state, span, capacity)` opens the window directory `state`.
 Constructing a `Window` never creates the directory or the data file; only a
-mutation (`observe`/`observe_many`/`observe_events`/`advance`/`restore`) does. Read-only calls on a window that
+mutation (`observe`/`observe_many`/`observe_events`/`deliver_events`/`advance`/`restore`) does. Read-only calls on a window that
 has never committed answer from the empty state and leave the filesystem alone.
 - `observe(key) -> bool` records a sighting and returns whether the key was newly admitted.
 - `observe_many(keys) -> list[bool]` records a list of string keys as one atomic batch, returning one boolean per input item in order; all items use the current time at the batch start, time is not advanced, an evicted key reappearing within the batch is readmitted, and only a batch that admits something adds one commit. A non-list or a non-string element raises `TypeError`; an empty list returns `[]` without touching the filesystem; a corrupt state or settings mismatch on a valid non-empty batch raises `ValueError` without overwriting the state.
 - `observe_events(events, watermark) -> list[str]` processes one out-of-order event batch atomically. `events` is a list of objects with string `key` and numeric `timestamp`; it returns one `"admitted"`/`"duplicate"`/`"late"` string per event in input order. The batch first moves time to `watermark` and expires the span, then classifies each event: `watermark - timestamp > span` is `late` (checked before duplicates; the boundary is valid), a retained key is `duplicate` (no time/order refresh), anything else is `admitted` at the event timestamp. Keys stay ordered by first sighting, ties by admission order; a full window evicts the current oldest key, which can be readmitted later in the same batch. Only admissions grow `admitted` and only time expiry grows `expired`; one commit is added when the watermark moves, an expiry occurs or an event is admitted (an empty list still advances/expires). A wrong argument type raises `TypeError`; a missing field, non-finite or negative time, future event, watermark regression, corrupt state or settings mismatch raises `ValueError`; either leaves the window state and any existing file unchanged and a failed validation creates no directory.
+- `deliver_events(delivery_id, events, watermark) -> list[str]` idempotently delivers one event-time batch. The first successful call for a `delivery_id` follows the exact classification, eviction and counter rules of `observe_events` and commits the event changes together with one receipt (an empty or all-duplicate batch also commits). The newest 128 distinct identifiers are retained in first successful commit order; the oldest is evicted past that limit, a replay never refreshes an entry, and time advancement or key expiry never evicts one. A retained identifier returns the original classifications only when the watermark and the ordered `key`/`timestamp` contents match (extra event fields are ignored; numerically equal ints and floats are equivalent); the replay changes no time, counters or file and succeeds even when its watermark lags the current time. A content mismatch raises `ValueError`. An evicted identifier is handled as a new request, where a watermark behind the current time raises `ValueError`. A non-string `delivery_id` raises `TypeError` and an empty one raises `ValueError`; the remaining validation matches `observe_events` and completes before any filesystem access, and a corrupt state or settings mismatch raises `ValueError` without creating a directory or altering a file.
 - `seen(key) -> bool` reports membership without recording anything.
 - `advance(now) -> int` drops everything older than the span and returns how many keys went.
 - `keys() -> list[str]` retained keys, oldest sighting first.

@@ -80,6 +80,12 @@ _MIN_ANCHOR_BYTES = 4096
 
 _EXPORT_FORMAT = "dedupe-window-export"
 
+# A batch-level idempotency receipt remembers the original classification of
+# a successful :meth:`Window.deliver_events` call.  Receipts form a ring of at
+# most this many distinct identifiers, evicted oldest first by first
+# successful commit; a replay never refreshes an entry's position.
+_RECEIPT_LIMIT = 128
+
 
 def _is_number(value):
     """Numbers are ints or floats; booleans do not count."""
@@ -212,6 +218,75 @@ def _validate_snapshot(body):
     return _validate_settings_body(body, what="state file", require_version=True)
 
 
+def _validate_receipts(raw, what):
+    """Validate an ordered list of delivery receipts; return entries.
+
+    Each entry is ``[delivery_id, watermark, events, kinds]`` with events a
+    list of ``[key, timestamp]`` pairs and kinds one classification per event.
+    Identifiers are non-empty strings, unique within the list, kept in first
+    successful commit order.  The on-disk values must be well typed (an int
+    and an equal float are equivalent when a replay compares against them, but
+    the stored bytes themselves must be valid).
+    """
+    if not isinstance(raw, list):
+        raise ValueError(f"{what} receipts must be a list")
+    if len(raw) > _RECEIPT_LIMIT:
+        raise ValueError(f"{what} holds more receipts than the receipt limit")
+    receipts = []
+    seen_ids = set()
+    for item in raw:
+        if not isinstance(item, list) or len(item) != 4:
+            raise ValueError(f"{what} holds a malformed receipt")
+        delivery_id, watermark, events, kinds = item
+        if not isinstance(delivery_id, str) or not delivery_id:
+            raise ValueError(f"{what} holds a receipt with a malformed identifier")
+        if delivery_id in seen_ids:
+            raise ValueError(f"{what} holds a duplicate receipt identifier")
+        if not _is_finite_time(watermark):
+            raise ValueError(f"{what} holds a receipt with an invalid watermark")
+        if not isinstance(events, list):
+            raise ValueError(f"{what} holds a receipt with malformed events")
+        prepared = []
+        for pair in events:
+            key, timestamp = _check_entry(pair, what)
+            if not _is_finite_time(timestamp) or timestamp > watermark:
+                raise ValueError(f"{what} holds a receipt event outside the timeline")
+            prepared.append([key, timestamp])
+        if (
+            not isinstance(kinds, list)
+            or len(kinds) != len(prepared)
+            or not all(isinstance(kind, str) and kind in _EVENT_KINDS
+                       for kind in kinds)
+        ):
+            raise ValueError(f"{what} holds a receipt with malformed results")
+        seen_ids.add(delivery_id)
+        receipts.append([delivery_id, watermark, prepared, list(kinds)])
+    return receipts
+
+
+def _check_receipt_advance(old, new, now):
+    """Validate the ring transition of one commit at an anchor boundary.
+
+    An anchor is one commit past its predecessor, so the ring is either
+    unchanged (a non-delivery commit) or gains exactly one entry at the tail
+    -- dropping the head first only when the limit is reached -- whose
+    watermark equals the anchor's current time.  The entries themselves are
+    already checksummed and structurally validated.
+    """
+    if new == old:
+        return
+    if not (len(old) <= _RECEIPT_LIMIT and len(new) <= _RECEIPT_LIMIT):
+        raise ValueError("state file anchor receipts are inconsistent")
+    dropped = len(old) + 1 - len(new)
+    if dropped not in (0, 1):
+        raise ValueError("state file anchor receipts are inconsistent")
+    if old[dropped:] != new[:len(old) - dropped]:
+        raise ValueError("state file anchor receipts are inconsistent")
+    added = new[-1]
+    if added[0] in {entry[0] for entry in old} or added[1] != now:
+        raise ValueError("state file anchor receipts are inconsistent")
+
+
 class _ParsedState:
     """The verified result of reading a state file."""
 
@@ -223,6 +298,7 @@ class _ParsedState:
         "admitted",
         "expired",
         "entries",
+        "receipts",
         "seq",
         "tip",
         "anchor_bytes",
@@ -253,6 +329,7 @@ def _parse_v1(document, size):
         admitted=admitted,
         expired=expired,
         entries=entries,
+        receipts=[],
         seq=0,
         tip=document["checksum"],
         anchor_bytes=size,
@@ -285,6 +362,7 @@ def _parse_v2_single(document, size):
         admitted=admitted,
         expired=expired,
         entries=entries,
+        receipts=[],
         seq=seq,
         tip=document["checksum"],
         anchor_bytes=size,
@@ -423,6 +501,7 @@ def _parse_v2_log(text):
         admitted=admitted,
         expired=expired,
         entries=entries,
+        receipts=[],
         seq=seq,
         tip=tip,
         anchor_bytes=base_bytes,
@@ -461,6 +540,7 @@ def _v3_anchor_info(document, *, allow_base):
         if not isinstance(prev, str):
             raise ValueError("state file anchor has a malformed predecessor")
     span, capacity, now, admitted, expired, entries = _validate_snapshot(body)
+    receipts = _validate_receipts(body.get("receipts", []), "state file")
     return {
         "kind": kind,
         "seq": seq,
@@ -472,6 +552,7 @@ def _v3_anchor_info(document, *, allow_base):
         "admitted": admitted,
         "expired": expired,
         "entries": entries,
+        "receipts": receipts,
     }
 
 
@@ -505,6 +586,10 @@ def _apply_v3_delta(line, state, index, max_first):
         )
     if op == "events":
         return _apply_v3_events_delta(
+            body, state, index, max_first, document["checksum"]
+        )
+    if op == "deliver":
+        return _apply_v3_deliver_delta(
             body, state, index, max_first, document["checksum"]
         )
     fields = ("now", "admitted", "expired", "drop", "add")
@@ -649,46 +734,15 @@ def _insert_by_first(entries, pair):
     entries.insert(lo, pair)
 
 
-def _apply_v3_events_delta(body, state, index, max_first, checksum):
-    """Validate and replay one v3 event-time batch segment.
+def _simulate_event_batch(state, index, max_first, new_now, events):
+    """Replay an event-time batch against a simulated pre-batch state.
 
-    Like the key batch segment, the segment stores the inputs (each event's
-    key and timestamp) and the per-item result kinds; replay advances the
-    watermark, expires the span prefix and recomputes every classification,
-    including a key expired or capacity-evicted and readmitted within the
-    same commit.
+    Advances the simulated window to ``new_now`` (expiring the span prefix)
+    and classifies each ``(key, timestamp)`` event in input order.  Returns
+    the simulated retained entries/index, the per-event kinds, the admission
+    and expiry counts and the new max first sighting, without touching
+    ``state`` itself.
     """
-    fields = ("now", "admitted", "expired", "wmark", "events", "kinds")
-    if any(field not in body for field in fields):
-        raise ValueError("state file holds a malformed segment")
-    pre_now = state["now"]
-    wmark = body["wmark"]
-    if not _is_finite_time(wmark) or wmark != pre_now:
-        raise ValueError("state file events segment moves the previous watermark")
-    new_now = body["now"]
-    if not _is_finite_time(new_now) or new_now < pre_now:
-        raise ValueError("state file segment moves time backwards")
-    new_admitted = body["admitted"]
-    new_expired = body["expired"]
-    if not _is_count(new_admitted) or not _is_count(new_expired):
-        raise ValueError("state file segment has an invalid count")
-    raw_events = body["events"]
-    raw_kinds = body["kinds"]
-    if (
-        not isinstance(raw_events, list)
-        or not isinstance(raw_kinds, list)
-        or len(raw_kinds) != len(raw_events)
-        or not all(isinstance(kind, str) and kind in _EVENT_KINDS
-                   for kind in raw_kinds)
-    ):
-        raise ValueError("state file events segment is malformed")
-    events = []
-    for item in raw_events:
-        key, timestamp = _check_entry(item, "state file segment")
-        if not _is_finite_time(timestamp) or timestamp > new_now:
-            raise ValueError("state file segment holds an event outside the timeline")
-        events.append((key, timestamp))
-
     span = state["span"]
     capacity = state["capacity"]
     simulated = [list(pair) for pair in state["entries"]]
@@ -715,13 +769,34 @@ def _apply_v3_events_delta(body, state, index, max_first, checksum):
         pair = [key, timestamp]
         _insert_by_first(simulated, pair)
         simulated_index.add(key)
-    if raw_kinds != expected_kinds:
-        raise ValueError("state file events segment results are inconsistent")
-    if new_admitted != state["admitted"] + admitted_count:
-        raise ValueError("state file segment counts are inconsistent")
-    if new_expired != state["expired"] + expiry_count:
-        raise ValueError("state file segment counts are inconsistent")
-    if len(simulated) > capacity:
+    new_max_first = simulated[-1][1] if simulated else max_first
+    return (
+        simulated,
+        simulated_index,
+        expected_kinds,
+        admitted_count,
+        expiry_count,
+        new_max_first,
+    )
+
+
+def _parse_segment_events(raw_events, new_now):
+    """Validate a segment's ``events`` field; return ``(key, timestamp)`` list."""
+    if not isinstance(raw_events, list):
+        raise ValueError("state file events segment is malformed")
+    events = []
+    for item in raw_events:
+        key, timestamp = _check_entry(item, "state file segment")
+        if not _is_finite_time(timestamp) or timestamp > new_now:
+            raise ValueError("state file segment holds an event outside the timeline")
+        events.append((key, timestamp))
+    return events
+
+
+def _adopt_simulated(state, index, simulated, simulated_index, new_now,
+                     new_admitted, new_expired, seq, checksum):
+    """Commit a simulated post-batch state into the replay ``state``."""
+    if len(simulated) > state["capacity"]:
         raise ValueError("state file holds more keys than the capacity allows")
     state["entries"] = simulated
     index.clear()
@@ -729,9 +804,149 @@ def _apply_v3_events_delta(body, state, index, max_first, checksum):
     state["now"] = new_now
     state["admitted"] = new_admitted
     state["expired"] = new_expired
-    state["seq"] = body["seq"]
+    state["seq"] = seq
     state["tip"] = checksum
-    return simulated[-1][1] if simulated else max_first
+
+
+def _apply_v3_events_delta(body, state, index, max_first, checksum):
+    """Validate and replay one v3 event-time batch segment.
+
+    Like the key batch segment, the segment stores the inputs (each event's
+    key and timestamp) and the per-item result kinds; replay advances the
+    watermark, expires the span prefix and recomputes every classification,
+    including a key expired or capacity-evicted and readmitted within the
+    same commit.
+    """
+    fields = ("now", "admitted", "expired", "wmark", "events", "kinds")
+    if any(field not in body for field in fields):
+        raise ValueError("state file holds a malformed segment")
+    pre_now = state["now"]
+    wmark = body["wmark"]
+    if not _is_finite_time(wmark) or wmark != pre_now:
+        raise ValueError("state file events segment moves the previous watermark")
+    new_now = body["now"]
+    if not _is_finite_time(new_now) or new_now < pre_now:
+        raise ValueError("state file segment moves time backwards")
+    new_admitted = body["admitted"]
+    new_expired = body["expired"]
+    if not _is_count(new_admitted) or not _is_count(new_expired):
+        raise ValueError("state file segment has an invalid count")
+    raw_kinds = body["kinds"]
+    events = _parse_segment_events(body["events"], new_now)
+    if (
+        not isinstance(raw_kinds, list)
+        or len(raw_kinds) != len(events)
+        or not all(isinstance(kind, str) and kind in _EVENT_KINDS
+                   for kind in raw_kinds)
+    ):
+        raise ValueError("state file events segment is malformed")
+
+    (
+        simulated,
+        simulated_index,
+        expected_kinds,
+        admitted_count,
+        expiry_count,
+        new_max_first,
+    ) = _simulate_event_batch(state, index, max_first, new_now, events)
+    if raw_kinds != expected_kinds:
+        raise ValueError("state file events segment results are inconsistent")
+    if new_admitted != state["admitted"] + admitted_count:
+        raise ValueError("state file segment counts are inconsistent")
+    if new_expired != state["expired"] + expiry_count:
+        raise ValueError("state file segment counts are inconsistent")
+    _adopt_simulated(
+        state, index, simulated, simulated_index, new_now,
+        new_admitted, new_expired, body["seq"], checksum,
+    )
+    return new_max_first
+
+
+def _apply_v3_deliver_delta(body, state, index, max_first, checksum):
+    """Validate and replay one v3 idempotent delivery segment.
+
+    A delivery behaves exactly like an event-time batch, and additionally
+    records its receipt: the identifier, requested watermark, ordered inputs
+    and original result kinds, plus the ring of receipts after evicting the
+    oldest entries beyond the limit.  Replay recomputes the classification and
+    cross-checks it against the stored receipt, so a tampered input or result
+    is detected even though the envelope checksum still verifies.
+    """
+    fields = (
+        "now", "admitted", "expired", "wmark", "events", "kinds",
+        "receipt", "receipts",
+    )
+    if any(field not in body for field in fields):
+        raise ValueError("state file holds a malformed segment")
+    pre_now = state["now"]
+    wmark = body["wmark"]
+    if not _is_finite_time(wmark) or wmark != pre_now:
+        raise ValueError("state file events segment moves the previous watermark")
+    new_now = body["now"]
+    if not _is_finite_time(new_now) or new_now < pre_now:
+        raise ValueError("state file segment moves time backwards")
+    new_admitted = body["admitted"]
+    new_expired = body["expired"]
+    if not _is_count(new_admitted) or not _is_count(new_expired):
+        raise ValueError("state file segment has an invalid count")
+    raw_kinds = body["kinds"]
+    events = _parse_segment_events(body["events"], new_now)
+    if (
+        not isinstance(raw_kinds, list)
+        or len(raw_kinds) != len(events)
+        or not all(isinstance(kind, str) and kind in _EVENT_KINDS
+                   for kind in raw_kinds)
+    ):
+        raise ValueError("state file events segment is malformed")
+
+    receipt = body["receipt"]
+    if not isinstance(receipt, list) or len(receipt) != 3:
+        raise ValueError("state file delivery segment holds a malformed receipt")
+    delivery_id, req_wmark, req_events = receipt
+    if not isinstance(delivery_id, str) or not delivery_id:
+        raise ValueError("state file delivery segment holds a malformed identifier")
+    if not _is_finite_time(req_wmark) or req_wmark != new_now:
+        raise ValueError("state file delivery segment holds an inconsistent watermark")
+    stored_reqs = _parse_segment_events(req_events, new_now)
+    if stored_reqs != list(events):
+        raise ValueError("state file delivery segment receipt does not match its events")
+
+    prior = state.get("receipts")
+    if prior is None:
+        # Replaying a delivery delta without a receipt-bearing predecessor is
+        # unrecoverable state, never a silently empty ring.
+        raise ValueError("state file delivery segment is missing its receipt history")
+    if any(entry[0] == delivery_id for entry in prior):
+        raise ValueError("state file delivery segment repeats a live receipt identifier")
+    receipts = _validate_receipts(body["receipts"], "state file segment")
+    expected_ring = prior + [[delivery_id, new_now,
+                              [[k, t] for k, t in events], list(raw_kinds)]]
+    if len(expected_ring) > _RECEIPT_LIMIT:
+        expected_ring = expected_ring[len(expected_ring) - _RECEIPT_LIMIT:]
+    if receipts != expected_ring:
+        raise ValueError("state file delivery segment receipts are inconsistent")
+
+    (
+        simulated,
+        simulated_index,
+        expected_kinds,
+        admitted_count,
+        expiry_count,
+        new_max_first,
+    ) = _simulate_event_batch(state, index, max_first, new_now, events)
+    if raw_kinds != expected_kinds:
+        raise ValueError("state file events segment results are inconsistent")
+    if new_admitted != state["admitted"] + admitted_count:
+        raise ValueError("state file segment counts are inconsistent")
+    if new_expired != state["expired"] + expiry_count:
+        raise ValueError("state file segment counts are inconsistent")
+    _adopt_simulated(
+        state, index, simulated, simulated_index, new_now,
+        new_admitted, new_expired, body["seq"], checksum,
+    )
+    state["receipts"] = receipts
+    return new_max_first
+
 
 
 def _state_from_anchor(info):
@@ -744,6 +959,8 @@ def _state_from_anchor(info):
         "admitted": info["admitted"],
         "expired": info["expired"],
         "entries": [list(pair) for pair in info["entries"]],
+        "receipts": [[r[0], r[1], [list(p) for p in r[2]], list(r[3])]
+                     for r in info["receipts"]],
     }
 
 
@@ -810,6 +1027,9 @@ def _parse_v3(text):
                 # checksum already binds its snapshot to its bytes.
                 if info["admitted"] < state["admitted"] or info["expired"] < state["expired"]:
                     raise ValueError("state file anchor counts are inconsistent")
+                _check_receipt_advance(
+                    state["receipts"], info["receipts"], info["now"]
+                )
             elif kind == "delta":
                 max_first = _apply_v3_delta(lines[i], state, index, max_first)
             else:
@@ -840,6 +1060,7 @@ def _parse_v3(text):
         admitted=state["admitted"],
         expired=state["expired"],
         entries=state["entries"],
+        receipts=state["receipts"],
         seq=state["seq"],
         tip=state["tip"],
         anchor_bytes=anchor_len,
@@ -926,6 +1147,7 @@ def _parse_state_file(path):
                 admitted=info["admitted"],
                 expired=info["expired"],
                 entries=info["entries"],
+                receipts=info["receipts"],
                 seq=info["seq"],
                 tip=info["tip"],
                 anchor_bytes=len(raw),
@@ -1011,6 +1233,7 @@ def _parse_tip_state(path):
         admitted=state["admitted"],
         expired=state["expired"],
         entries=state["entries"],
+        receipts=state["receipts"],
         seq=state["seq"],
         tip=state["tip"],
         anchor_bytes=0,
@@ -1035,9 +1258,27 @@ def read_settings(path):
 # ---------------------------------------------------------------------------
 
 
+def _serialize_receipts(receipts):
+    """Deep-copy a receipt ring into plain JSON-ready lists."""
+    return [
+        [
+            delivery_id,
+            watermark,
+            [[key, timestamp] for key, timestamp in events],
+            list(kinds),
+        ]
+        for delivery_id, watermark, events, kinds in receipts
+    ]
+
+
 def _export_body(snapshot):
-    """The checksum-covered body of an export document."""
-    return {
+    """The checksum-covered body of an export document.
+
+    The receipt ring is included only when non-empty, so an export of a commit
+    with no live receipts -- every commit of an old state included -- is byte
+    for byte the document it always was.
+    """
+    body = {
         "format": _EXPORT_FORMAT,
         "seq": snapshot["seq"],
         "span": snapshot["span"],
@@ -1047,6 +1288,10 @@ def _export_body(snapshot):
         "expired": snapshot["expired"],
         "keys": [[key, first] for key, first in snapshot["entries"]],
     }
+    receipts = _serialize_receipts(snapshot.get("receipts", []))
+    if receipts:
+        body["receipts"] = receipts
+    return body
 
 
 def _make_export_document(snapshot):
@@ -1057,7 +1302,11 @@ def _make_export_document(snapshot):
 
 
 def _validate_export(body):
-    """Validate the contents of an export document; return its fields."""
+    """Validate the contents of an export document; return its fields.
+
+    A document without a ``receipts`` field is an old export and carries an
+    empty ring.
+    """
     if body.get("format") != _EXPORT_FORMAT:
         raise ValueError("export document has an unrecognized format")
     seq = body.get("seq")
@@ -1066,7 +1315,8 @@ def _validate_export(body):
     span, capacity, now, admitted, expired, entries = _validate_settings_body(
         body, what="export document", require_version=False
     )
-    return seq, span, capacity, now, admitted, expired, entries
+    receipts = _validate_receipts(body.get("receipts", []), "export document")
+    return seq, span, capacity, now, admitted, expired, entries, receipts
 
 
 class Window:
@@ -1090,6 +1340,9 @@ class Window:
         self._index = {}    # key -> first_seen, mirrors _entries
         self._admitted = 0
         self._expired = 0
+        # Idempotency receipts, oldest first-successful commit first; each is
+        # [delivery_id, watermark, [[key, timestamp], ...], [kind, ...]].
+        self._receipts = []
         self._last_commit = None    # checksum at the tip of the chain last seen
         self._seq = 0               # sequence number of the last commit
         self._loaded_version = _VERSION  # format of the file last read
@@ -1199,6 +1452,73 @@ class Window:
                 self._commit("batch", [], [], batch_keys=keys, batch_hits=hits)
             return hits
 
+    @staticmethod
+    def _validate_event_request(events, watermark):
+        """Validate an event batch's arguments; return prepared pairs.
+
+        Mirrors the checks :meth:`observe_events` documents: wrong types raise
+        ``TypeError``; missing fields, non-finite or negative times and events
+        later than the watermark raise ``ValueError``.
+        """
+        if not isinstance(events, list):
+            raise TypeError("events must be a list of event objects")
+        if not _is_number(watermark):
+            raise TypeError("watermark must be an int or float")
+        if not math.isfinite(watermark) or watermark < 0:
+            raise ValueError("watermark must be finite and non-negative")
+        prepared = []
+        for event in events:
+            if not isinstance(event, dict):
+                raise TypeError("each event must be an object with key and timestamp")
+            if "key" not in event or "timestamp" not in event:
+                raise ValueError("each event must carry key and timestamp")
+            key = event["key"]
+            timestamp = event["timestamp"]
+            if not isinstance(key, str):
+                raise TypeError("event key must be a string")
+            if not _is_number(timestamp):
+                raise TypeError("event timestamp must be an int or float")
+            if not math.isfinite(timestamp) or timestamp < 0:
+                raise ValueError("event timestamp must be finite and non-negative")
+            if timestamp > watermark:
+                raise ValueError("event timestamp is later than the watermark")
+            prepared.append((key, timestamp))
+        return prepared
+
+    def _mutate_event_batch(self, prepared, watermark):
+        """Advance time, expire and classify; caller holds the lock.
+
+        Returns ``(kinds, previous_now, moved, dropped, admitted_any)``.
+        """
+        moved = watermark != self._now
+        previous_now = self._now
+        self._now = watermark
+        dropped = []
+        while self._entries and watermark - self._entries[0][1] > self._span:
+            key, _ = self._entries.pop(0)
+            del self._index[key]
+            dropped.append(key)
+        self._expired += len(dropped)
+        kinds = []
+        admitted_any = False
+        for key, timestamp in prepared:
+            if watermark - timestamp > self._span:
+                kinds.append("late")
+                continue
+            if key in self._index:
+                kinds.append("duplicate")
+                continue
+            kinds.append("admitted")
+            admitted_any = True
+            while len(self._entries) >= self._capacity:
+                oldest, _ = self._entries.pop(0)
+                del self._index[oldest]
+            pair = [key, timestamp]
+            _insert_by_first(self._entries, pair)
+            self._index[key] = timestamp
+            self._admitted += 1
+        return kinds, previous_now, moved, dropped, admitted_any
+
     def observe_events(self, events, watermark):
         """Process one event-time batch against ``watermark``.
 
@@ -1233,29 +1553,7 @@ class Window:
         ``ValueError``; neither creates the state directory nor changes an
         existing state file.
         """
-        if not isinstance(events, list):
-            raise TypeError("events must be a list of event objects")
-        if not _is_number(watermark):
-            raise TypeError("watermark must be an int or float")
-        if not math.isfinite(watermark) or watermark < 0:
-            raise ValueError("watermark must be finite and non-negative")
-        prepared = []
-        for event in events:
-            if not isinstance(event, dict):
-                raise TypeError("each event must be an object with key and timestamp")
-            if "key" not in event or "timestamp" not in event:
-                raise ValueError("each event must carry key and timestamp")
-            key = event["key"]
-            timestamp = event["timestamp"]
-            if not isinstance(key, str):
-                raise TypeError("event key must be a string")
-            if not _is_number(timestamp):
-                raise TypeError("event timestamp must be an int or float")
-            if not math.isfinite(timestamp) or timestamp < 0:
-                raise ValueError("event timestamp must be finite and non-negative")
-            if timestamp > watermark:
-                raise ValueError("event timestamp is later than the watermark")
-            prepared.append((key, timestamp))
+        prepared = self._validate_event_request(events, watermark)
         # Monotonicity against this process's own clock is checkable without
         # touching the filesystem, so reject it before any directory exists.
         if watermark < self._clock:
@@ -1281,33 +1579,9 @@ class Window:
                 # regression through shared state is rejected, not contended.
                 raise ValueError("watermark is earlier than the current time")
             self._clock = watermark
-            moved = watermark != self._now
-            previous_now = self._now
-            self._now = watermark
-            dropped = []
-            while self._entries and watermark - self._entries[0][1] > self._span:
-                key, _ = self._entries.pop(0)
-                del self._index[key]
-                dropped.append(key)
-            self._expired += len(dropped)
-            kinds = []
-            admitted_any = False
-            for key, timestamp in prepared:
-                if watermark - timestamp > self._span:
-                    kinds.append("late")
-                    continue
-                if key in self._index:
-                    kinds.append("duplicate")
-                    continue
-                kinds.append("admitted")
-                admitted_any = True
-                while len(self._entries) >= self._capacity:
-                    oldest, _ = self._entries.pop(0)
-                    del self._index[oldest]
-                pair = [key, timestamp]
-                _insert_by_first(self._entries, pair)
-                self._index[key] = timestamp
-                self._admitted += 1
+            kinds, previous_now, moved, dropped, admitted_any = (
+                self._mutate_event_batch(prepared, watermark)
+            )
             if moved or dropped or admitted_any:
                 self._commit(
                     "events",
@@ -1317,6 +1591,91 @@ class Window:
                     event_kinds=kinds,
                     event_wmark=previous_now,
                 )
+            return kinds
+
+    @staticmethod
+    def _find_receipt(receipts, delivery_id):
+        """Return the live receipt for ``delivery_id`` (exact string match)."""
+        for receipt in receipts:
+            if receipt[0] == delivery_id:
+                return receipt
+        return None
+
+    def deliver_events(self, delivery_id, events, watermark):
+        """Idempotently deliver one event-time batch.
+
+        Behaves exactly like :meth:`observe_events` on the first successful
+        delivery of ``delivery_id`` -- same classification, eviction and
+        counter semantics, one commit shared by the event changes and the
+        idempotency receipt (an empty batch or an all-duplicate batch commits
+        too) -- and replays the original classification on every later call
+        with the same identifier.
+
+        A retained identifier replays only when the watermark and the ordered
+        ``key``/``timestamp`` contents match (extra event fields are ignored;
+        an int and a float compare equal when numerically equal).  A replay
+        returns the original list without advancing time, moving a counter or
+        touching the file, and succeeds even when its watermark now lags the
+        current time.  A content mismatch raises ``ValueError``.  Identifiers
+        are compared as raw strings; a non-string raises ``TypeError`` and an
+        empty string raises ``ValueError``.  Once an identifier falls out of
+        the newest 128 receipts it is treated as a new request, for which a
+        watermark behind the current time raises ``ValueError``.
+
+        As with :meth:`observe_events`, all argument validation completes
+        before any filesystem access; a corrupt state or settings mismatch
+        raises ``ValueError`` and a failed validation creates no directory.
+        """
+        if not isinstance(delivery_id, str):
+            raise TypeError("delivery_id must be a string")
+        if delivery_id == "":
+            raise ValueError("delivery_id must not be empty")
+        prepared = self._validate_event_request(events, watermark)
+        # Unlike observe_events this always takes the lock: an empty or
+        # all-duplicate delivery still records its receipt, and a live
+        # identifier replays regardless of the current watermark, so the
+        # fresh-window fast path and the process-clock shortcut do not apply.
+        self._ensure_dir()
+        with self._locked(True):
+            self._reload_if_present()
+            replay = self._find_receipt(self._receipts, delivery_id)
+            if replay is not None:
+                _, old_wmark, old_events, old_kinds = replay
+                if (
+                    old_wmark != watermark
+                    or old_events != [[key, ts] for key, ts in prepared]
+                ):
+                    raise ValueError(
+                        "delivery content does not match the original delivery"
+                    )
+                return list(old_kinds)
+            if watermark < self._now or watermark < self._clock:
+                # The identifier is not retained, so this is a new request;
+                # new deliveries may not move the watermark backwards, either
+                # past the shared committed time or this process's own clock.
+                raise ValueError("watermark is earlier than the current time")
+            self._clock = watermark
+            kinds, previous_now, _moved, dropped, _admitted_any = (
+                self._mutate_event_batch(prepared, watermark)
+            )
+            receipt = [
+                delivery_id,
+                watermark,
+                [[key, ts] for key, ts in prepared],
+                list(kinds),
+            ]
+            self._receipts.append(receipt)
+            if len(self._receipts) > _RECEIPT_LIMIT:
+                del self._receipts[: len(self._receipts) - _RECEIPT_LIMIT]
+            self._commit(
+                "deliver",
+                dropped,
+                [],
+                event_items=prepared,
+                event_kinds=kinds,
+                event_wmark=previous_now,
+                delivery_id=delivery_id,
+            )
             return kinds
 
     def advance(self, now):
@@ -1387,6 +1746,7 @@ class Window:
             admitted,
             expired,
             entries,
+            receipts,
         ) = self._check_restore_document(document)
         self._ensure_dir()
         with self._locked(True):
@@ -1397,6 +1757,7 @@ class Window:
             self._expired = expired
             self._entries = [list(pair) for pair in entries]
             self._index = {key: first for key, first in self._entries}
+            self._receipts = _serialize_receipts(receipts)
             self._clock = now
             self._seq = seq
             # The restored state replaces the whole file atomically; it
@@ -1429,6 +1790,7 @@ class Window:
                 "admitted": self._admitted,
                 "expired": self._expired,
                 "entries": self._entries,
+                "receipts": self._receipts,
                 "seq": self._seq,
             }
         return {
@@ -1438,6 +1800,7 @@ class Window:
             "admitted": parsed.admitted,
             "expired": parsed.expired,
             "entries": parsed.entries,
+            "receipts": parsed.receipts,
             "seq": parsed.seq,
         }
 
@@ -1565,6 +1928,7 @@ class Window:
         self._expired = parsed.expired
         self._entries = [list(pair) for pair in parsed.entries]
         self._index = {key: first for key, first in self._entries}
+        self._receipts = _serialize_receipts(parsed.receipts)
         self._last_commit = parsed.tip
         self._seq = parsed.seq
         self._loaded_version = parsed.version
@@ -1618,6 +1982,11 @@ class Window:
             "seq": seq,
             "keys": [[key, first] for key, first in self._entries],
         }
+        # The receipt ring rides in every base/anchor snapshot; omitting an
+        # empty ring keeps the no-receipt shape byte-identical to before.
+        receipts = _serialize_receipts(self._receipts)
+        if receipts:
+            body["receipts"] = receipts
         if prev is not None:
             body["prev"] = prev
         return body
@@ -1700,7 +2069,8 @@ class Window:
         return envelope["checksum"], data
 
     def _commit(self, op, drop, add, batch_keys=(), batch_hits=(),
-                event_items=(), event_kinds=(), event_wmark=None):
+                event_items=(), event_kinds=(), event_wmark=None,
+                delivery_id=None):
         """Commit the in-memory state as the next commit; caller holds lock."""
         self._sweep_temp_files()
         if self._needs_anchor():
@@ -1744,6 +2114,20 @@ class Window:
             body["wmark"] = event_wmark
             body["events"] = [[key, timestamp] for key, timestamp in event_items]
             body["kinds"] = list(event_kinds)
+        elif op == "deliver":
+            # Same replay payload as an events segment, plus this delivery's
+            # receipt and the full post-commit ring.  The event changes and
+            # the receipt share the single record, so they commit or vanish
+            # together.
+            body["wmark"] = event_wmark
+            body["events"] = [[key, timestamp] for key, timestamp in event_items]
+            body["kinds"] = list(event_kinds)
+            body["receipt"] = [
+                delivery_id,
+                self._now,
+                [[key, timestamp] for key, timestamp in event_items],
+            ]
+            body["receipts"] = _serialize_receipts(self._receipts)
         else:
             body["drop"] = list(drop)
             body["add"] = [list(pair) for pair in add]
@@ -1808,6 +2192,7 @@ class Window:
             "admitted": parsed.admitted,
             "expired": parsed.expired,
             "entries": [list(pair) for pair in parsed.entries],
+            "receipts": _serialize_receipts(parsed.receipts),
         }
 
     @staticmethod
@@ -1822,6 +2207,7 @@ class Window:
             "admitted": info["admitted"],
             "expired": info["expired"],
             "entries": [list(pair) for pair in info["entries"]],
+            "receipts": _serialize_receipts(info["receipts"]),
         }
 
     def _locate_in_log(self, text, seq):
@@ -1917,4 +2303,5 @@ class Window:
             "admitted": state["admitted"],
             "expired": state["expired"],
             "entries": [list(pair) for pair in state["entries"]],
+            "receipts": _serialize_receipts(state.get("receipts", [])),
         }
