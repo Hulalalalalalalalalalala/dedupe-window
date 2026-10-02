@@ -1500,5 +1500,518 @@ class CliObserveBatchTests(unittest.TestCase):
         self.assertIn("usage", result.stderr.lower())
 
 
+class ObserveEventsTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_labels_in_input_order(self):
+        window = Window(self.dir, 10, 5)
+        results = window.observe_events(
+            [
+                {"key": "a", "timestamp": 0},
+                {"key": "b", "timestamp": 5},
+                {"key": "a", "timestamp": 4},
+                {"key": "old", "timestamp": 0},
+            ],
+            10,
+        )
+        # span 10, watermark 10: timestamp 0 is exactly on the boundary and
+        # still valid; everything is in time.
+        self.assertEqual(results,
+                         ["admitted", "admitted", "duplicate", "admitted"])
+
+    def test_late_boundary(self):
+        window = Window(self.dir, 10, 5)
+        window.observe_events(
+            [{"key": "a", "timestamp": 0}, {"key": "b", "timestamp": 5}], 5
+        )
+        # watermark 10: now - first == span keeps "a" (10 - 0 == 10)
+        self.assertEqual(window.keys(), ["a", "b"])
+        # a timestamp exactly on the boundary is still valid
+        self.assertEqual(
+            window.observe_events([{"key": "c", "timestamp": 3}], 10),
+            ["admitted"],
+        )
+        # watermark 11: "a" (first seen 0) expires; a sighting at 0 is late
+        # while "b" (11 - 5 == 6) and "c" (11 - 3 == 8) stay retained
+        results = window.observe_events(
+            [{"key": "a", "timestamp": 0}, {"key": "b", "timestamp": 5}], 11
+        )
+        self.assertEqual(results, ["late", "duplicate"])
+        # retained keys stay ordered by first sighting: c(3) before b(5)
+        self.assertEqual(window.keys(), ["c", "b"])
+        self.assertEqual(window.stats()["expired"], 1)
+
+    def test_late_takes_precedence_over_duplicate(self):
+        window = Window(self.dir, 10, 5)
+        window.observe_events([{"key": "a", "timestamp": 0}], 0)
+        self.assertEqual(
+            window.observe_events([{"key": "a", "timestamp": 0}], 11),
+            ["late"],
+        )
+        # a late repeat never refreshes the first sighting
+        self.assertEqual(window.keys(), [])
+
+    def test_watermark_advance_expires_before_events(self):
+        window = Window(self.dir, 10, 5)
+        window.observe_events([{"key": "a", "timestamp": 0}], 0)
+        results = window.observe_events(
+            [{"key": "a", "timestamp": 11}, {"key": "b", "timestamp": 11}], 11
+        )
+        # a expired at the advance, so the in-time sighting is a fresh admit
+        self.assertEqual(results, ["admitted", "admitted"])
+        self.assertEqual(window.keys(), ["a", "b"])
+        stats = window.stats()
+        self.assertEqual((stats["admitted"], stats["expired"]), (3, 1))
+
+    def test_duplicate_does_not_refresh_time_or_order(self):
+        window = Window(self.dir, 10, 5)
+        window.observe_events([
+            {"key": "a", "timestamp": 0},
+            {"key": "b", "timestamp": 4},
+        ], 5)
+        # a later-timestamped repeat is a duplicate and must not move "a"
+        self.assertEqual(
+            window.observe_events([{"key": "a", "timestamp": 5}], 6),
+            ["duplicate"],
+        )
+        doc = window.export(window._seq)
+        self.assertEqual(doc["keys"], [["a", 0], ["b", 4]])
+        # Advancing to 11 expires "a" by its ORIGINAL timestamp (11 - 0 >
+        # 10); had the repeat refreshed it to 5 it would survive (11 - 5).
+        window.observe_events([], 11)
+        self.assertEqual(window.keys(), ["b"])
+
+    def test_keys_ordered_by_first_time_then_admission(self):
+        window = Window(self.dir, 100, 10)
+        results = window.observe_events([
+            {"key": "x", "timestamp": 5},
+            {"key": "y", "timestamp": 1},
+            {"key": "z", "timestamp": 5},
+        ], 6)
+        self.assertEqual(results, ["admitted"] * 3)
+        doc = window.export(window._seq)
+        self.assertEqual(doc["keys"], [["y", 1], ["x", 5], ["z", 5]])
+        self.assertEqual(doc["now"], 6)
+
+    def test_capacity_evicts_oldest_and_is_not_expiry(self):
+        window = Window(self.dir, 100, 2)
+        results = window.observe_events([
+            {"key": "a", "timestamp": 1},
+            {"key": "b", "timestamp": 2},
+            {"key": "c", "timestamp": 3},
+            {"key": "a", "timestamp": 4},
+        ], 5)
+        self.assertEqual(results, ["admitted"] * 4)
+        self.assertEqual(window.keys(), ["c", "a"])
+        stats = window.stats()
+        self.assertEqual((stats["retained"], stats["admitted"], stats["expired"]),
+                         (2, 4, 0))
+
+    def test_intra_batch_evicted_key_readmitted_at_new_timestamp(self):
+        window = Window(self.dir, 100, 2)
+        results = window.observe_events([
+            {"key": "a", "timestamp": 1},
+            {"key": "b", "timestamp": 2},
+            {"key": "c", "timestamp": 3},
+            {"key": "a", "timestamp": 9},
+        ], 10)
+        self.assertEqual(results, ["admitted"] * 4)
+        # the readmitted a keeps its new timestamp 9
+        self.assertEqual(window.export(window._seq)["keys"],
+                         [["c", 3], ["a", 9]])
+
+    def test_empty_list_still_advances_and_expires(self):
+        window = Window(self.dir, 10, 3)
+        window.observe_events([{"key": "a", "timestamp": 0}], 0)
+        seq_before = window._seq
+        self.assertEqual(window.observe_events([], 11), [])
+        self.assertEqual(window.keys(), [])
+        self.assertEqual(window.stats()["expired"], 1)
+        self.assertEqual(window._seq, seq_before + 1)
+
+    def test_batch_adds_exactly_one_commit(self):
+        window = Window(self.dir, 100, 10)
+        window.observe_events([{"key": "seed", "timestamp": 0}], 0)
+        before = window._seq
+        window.observe_events([
+            {"key": "a", "timestamp": 1},
+            {"key": "seed", "timestamp": 1},
+            {"key": "b", "timestamp": 2},
+        ], 3)
+        self.assertEqual(window._seq, before + 1)
+        path = os.path.join(self.dir, "window.json")
+        segment = json.loads(open(path, "rb").read().decode().splitlines()[-1])
+        self.assertEqual((segment["kind"], segment["op"]), ("delta", "events"))
+        self.assertEqual(segment["seq"], before + 1)
+        self.assertEqual(segment["events"],
+                         [["a", 1], ["seed", 1], ["b", 2]])
+        self.assertEqual(segment["results"],
+                         ["admitted", "duplicate", "admitted"])
+        self.assertNotIn("drop", segment)
+        self.assertNotIn("add", segment)
+        self.assertNotIn("keys", segment)
+
+    def test_noop_batch_commits_nothing(self):
+        window = Window(self.dir, 10, 3)
+        window.observe_events([{"key": "a", "timestamp": 0}], 5)
+        path = os.path.join(self.dir, "window.json")
+        before = open(path, "rb").read()
+        seq_before = window._seq
+        # same watermark, an in-time duplicate, nothing expires
+        results = window.observe_events([{"key": "a", "timestamp": 3}], 5)
+        self.assertEqual(results, ["duplicate"])
+        self.assertEqual(window._seq, seq_before)
+        self.assertEqual(open(path, "rb").read(), before)
+
+    def test_persists_across_reopen(self):
+        window = Window(self.dir, 10, 3)
+        window.observe_events([
+            {"key": "a", "timestamp": 0},
+            {"key": "b", "timestamp": 5},
+        ], 5)
+        window.observe_events([
+            {"key": "c", "timestamp": 6},
+            {"key": "a", "timestamp": 2},
+        ], 8)
+        clone = Window(self.dir, 10, 3)
+        clone.load()
+        self.assertEqual(clone.keys(), window.keys())
+        self.assertEqual(clone.stats(), window.stats())
+        self.assertEqual(clone.export(clone._seq)["now"], 8)
+
+    def test_history_still_exportable_and_numbering_continues(self):
+        window = Window(self.dir, 100, 4)
+        window.observe_events([{"key": "a", "timestamp": 1}], 1)
+        first_seq = window._seq
+        first_doc = window.export(first_seq)
+        window.observe_events([{"key": "b", "timestamp": 2}], 2)
+        window.observe_events([{"key": "c", "timestamp": 3}], 3)
+        self.assertEqual(window.export(first_seq), first_doc)
+        window.observe("d")
+        self.assertEqual(window.export(window._seq)["seq"], 4)
+
+    def test_export_identical_across_compaction(self):
+        import dedupe_window.window as mod
+        window = Window(self.dir, 10 ** 9, 10 ** 9)
+        with mock.patch.object(mod, "_MAX_DELTAS", 4), \
+                mock.patch.object(mod, "_MIN_ANCHOR_BYTES", 64):
+            window.observe_events([{"key": "a", "timestamp": 0},
+                                   {"key": "b", "timestamp": 1}], 1)
+            seq = window._seq
+            doc = window.export(seq)
+            for i in range(40):
+                window.observe(f"k{i}")
+            self.assertEqual(window.export(seq), doc)
+
+    def test_restore_then_events_continues_numbering(self):
+        source = Window(tempfile.mkdtemp(), 100, 100)
+        for i in range(5):
+            source.observe(f"s{i}")
+        doc = source.export(5)
+        window = Window(self.dir, doc["span"], doc["capacity"])
+        window.restore(doc)
+        results = window.observe_events(
+            [{"key": "n1", "timestamp": doc["now"]},
+             {"key": "n2", "timestamp": doc["now"]}],
+            doc["now"],
+        )
+        self.assertEqual(results, ["admitted", "admitted"])
+        self.assertEqual(window._seq, 6)
+        exported = window.export(6)
+        self.assertEqual(exported["seq"], 6)
+        self.assertEqual(exported["admitted"], 7)
+        self.assertEqual(window.export(5), doc)
+
+    def test_watermark_regression_is_value_error(self):
+        window = Window(self.dir, 10, 3)
+        window.observe_events([], 8)
+        with self.assertRaises(ValueError):
+            window.observe_events([], 7)
+        # equal watermark is allowed (a no-op here)
+        self.assertEqual(window.observe_events([], 8), [])
+
+    def test_future_event_is_value_error(self):
+        state = os.path.join(self.dir, "never")
+        window = Window(state, 10, 3)
+        with self.assertRaises(ValueError):
+            window.observe_events([{"key": "a", "timestamp": 9}], 8)
+        self.assertFalse(os.path.exists(state))
+
+    def test_type_errors_create_nothing(self):
+        state = os.path.join(self.dir, "never")
+        window = Window(state, 10, 3)
+        for events, watermark in (
+            (None, 5),
+            ("ab", 5),
+            ({"key": "a", "timestamp": 1}, 5),
+            (True, 5),
+            (["a"], 5),
+            ([{"key": "a", "timestamp": "1"}], 5),
+            ([{"key": "a", "timestamp": True}], 5),
+            ([{"key": "a", "timestamp": None}], 5),
+            ([{"key": 1, "timestamp": 1}], 5),
+            ([{"key": b"a", "timestamp": 1}], 5),
+            ([], True),
+            ([], "5"),
+        ):
+            with self.assertRaises(TypeError, msg=repr((events, watermark))):
+                window.observe_events(events, watermark)
+        self.assertFalse(os.path.exists(state))
+
+    def test_value_errors_create_nothing(self):
+        state = os.path.join(self.dir, "never")
+        window = Window(state, 10, 3)
+        for events, watermark in (
+            ([{"timestamp": 1}], 5),
+            ([{"key": "a"}], 5),
+            ([{}], 5),
+            ([{"key": "a", "timestamp": -1}], 5),
+            ([{"key": "a", "timestamp": float("nan")}], 5),
+            ([{"key": "a", "timestamp": float("inf")}], 5),
+            ([], -1),
+            ([], float("nan")),
+            ([], float("inf")),
+        ):
+            with self.assertRaises(ValueError, msg=repr((events, watermark))):
+                window.observe_events(events, watermark)
+        self.assertFalse(os.path.exists(state))
+
+    def test_extra_event_fields_are_ignored(self):
+        window = Window(self.dir, 10, 3)
+        results = window.observe_events(
+            [{"key": "a", "timestamp": 0, "meta": {"x": 1}, "n": 2}], 1
+        )
+        self.assertEqual(results, ["admitted"])
+
+    def test_float_times(self):
+        window = Window(self.dir, 2.5, 3)
+        results = window.observe_events([
+            {"key": "a", "timestamp": 0.25},
+            {"key": "b", "timestamp": 2.0},
+        ], 2.5)
+        self.assertEqual(results, ["admitted", "admitted"])
+        # 2.5 - 0.25 == 2.25 within span; at watermark 3.0 it is 2.75 -> late
+        self.assertEqual(
+            window.observe_events([{"key": "a", "timestamp": 0.25}], 3.0),
+            ["late"],
+        )
+
+    def _write_raw(self, payload):
+        path = os.path.join(self.dir, "window.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+
+    def test_corrupt_state_raises_value_error_without_overwrite(self):
+        state = os.path.join(self.dir, "broken")
+        os.makedirs(state)
+        path = os.path.join(state, "window.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{broken")
+        raw_before = open(path, "rb").read()
+        window = Window(state, 10, 3)
+        with self.assertRaises(ValueError):
+            window.observe_events([{"key": "a", "timestamp": 0}], 0)
+        self.assertEqual(open(path, "rb").read(), raw_before)
+
+    def test_settings_mismatch_raises_value_error(self):
+        Window(self.dir, 10, 3).save()
+        with self.assertRaises(ValueError):
+            Window(self.dir, 99, 3).observe_events(
+                [{"key": "a", "timestamp": 0}], 0
+            )
+
+    def test_tampered_results_are_detected_on_replay(self):
+        window = Window(self.dir, 100, 3)
+        # commit 1 is the base snapshot; commit 2 is the "events" delta.
+        window.observe_events([{"key": "seed", "timestamp": 0}], 0)
+        window.observe_events([
+            {"key": "a", "timestamp": 0},
+            {"key": "a", "timestamp": 1},
+        ], 2)
+        path = os.path.join(self.dir, "window.json")
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        segment = json.loads(lines[-1])
+        self.assertEqual(segment["op"], "events")
+        segment["results"] = ["admitted", "admitted"]  # hide the duplicate
+        tampered = json.dumps(segment, sort_keys=True, separators=(",", ":"))
+        doc = json.loads(tampered)
+        doc["checksum"] = _export_checksum(doc)
+        lines[-1] = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + '\n{"kind":"delta",')
+        with self.assertRaises(ValueError):
+            Window(self.dir, 100, 3).load()
+
+
+class CliObserveEventsTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def run_cli(self, payload, *args):
+        state = args[0] if args else os.path.join(self.dir, "window")
+        return subprocess.run(
+            [sys.executable, "-m", "dedupe_window", "--state", state,
+             "observe-events"],
+            capture_output=True, text=True, input=payload,
+        )
+
+    def test_event_flow(self):
+        state = os.path.join(self.dir, "window")
+        seed = self.run_cli(
+            json.dumps({"events": [{"key": "a", "timestamp": 0}],
+                        "watermark": 0}),
+            state,
+        )
+        self.assertEqual(seed.returncode, 0, seed.stderr)
+        self.assertEqual(seed.stdout, '["admitted"]\n')
+        result = self.run_cli(
+            json.dumps({
+                "events": [
+                    {"key": "a", "timestamp": 5},
+                    {"key": "b", "timestamp": 5},
+                ],
+                "watermark": 10,
+            }),
+            state,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '["duplicate","admitted"]\n')
+        again = self.run_cli(
+            json.dumps({"events": [{"key": "b", "timestamp": 10}],
+                        "watermark": 10}),
+            state,
+        )
+        self.assertEqual(again.stdout, '["duplicate"]\n')
+
+    def test_late_result(self):
+        state = os.path.join(self.dir, "window")
+        # CLI default span is 60
+        self.run_cli(json.dumps({"events": [{"key": "a", "timestamp": 0}],
+                                 "watermark": 0}), state)
+        result = self.run_cli(
+            json.dumps({"events": [{"key": "a", "timestamp": 0}],
+                        "watermark": 61}),
+            state,
+        )
+        self.assertEqual((result.returncode, result.stdout),
+                         (0, '["late"]\n'))
+
+    def test_empty_events_advances_and_is_compact(self):
+        state = os.path.join(self.dir, "window")
+        result = self.run_cli(
+            json.dumps({"events": [], "watermark": 3}), state
+        )
+        self.assertEqual((result.returncode, result.stdout), (0, "[]\n"))
+        stats = subprocess.run(
+            [sys.executable, "-m", "dedupe_window", "--state", state, "stats"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(json.loads(stats.stdout)["admitted"], 0)
+
+    def test_surrounding_whitespace_allowed(self):
+        result = self.run_cli(
+            ' \n\t {"events":[{"key":"a","timestamp":0}],"watermark":1}\n  \t\n'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '["admitted"]\n')
+
+    def test_extra_fields_ignored(self):
+        result = self.run_cli(
+            json.dumps({"events": [], "watermark": 1, "extra": [1, 2]})
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "[]\n")
+
+    def test_failures_exit_1_one_line_prefix_empty_stdout(self):
+        cases = {
+            "empty input": "",
+            "whitespace only": "  \n\t",
+            "not json": "{not json",
+            "json array": json.dumps([]),
+            "json number": "123",
+            "json string": json.dumps("ab"),
+            "missing watermark": json.dumps({"events": []}),
+            "missing events": json.dumps({"watermark": 1}),
+            "events not array": json.dumps({"events": {}, "watermark": 1}),
+            "event not object": json.dumps({"events": ["a"], "watermark": 1}),
+            "missing key": json.dumps(
+                {"events": [{"timestamp": 1}], "watermark": 1}),
+            "missing timestamp": json.dumps(
+                {"events": [{"key": "a"}], "watermark": 1}),
+            "non-string key": json.dumps(
+                {"events": [{"key": 1, "timestamp": 1}], "watermark": 1}),
+            "bool timestamp": json.dumps(
+                {"events": [{"key": "a", "timestamp": True}], "watermark": 1}),
+            "negative timestamp": json.dumps(
+                {"events": [{"key": "a", "timestamp": -1}], "watermark": 1}),
+            "nan watermark": '{"events":[],"watermark":NaN}',
+            "bool watermark": json.dumps(
+                {"events": [], "watermark": True}),
+            "future event": json.dumps(
+                {"events": [{"key": "a", "timestamp": 9}], "watermark": 8}),
+            "trailing junk": '{"events":[],"watermark":1} junk',
+        }
+        for name, payload in cases.items():
+            state = os.path.join(self.dir, "case_" + name.replace(" ", "_"))
+            result = self.run_cli(payload, state)
+            self.assertEqual(result.returncode, 1, name)
+            self.assertEqual(result.stdout, "", name)
+            self.assertTrue(result.stderr.startswith("event batch failed"),
+                            name)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, name)
+            self.assertFalse(os.path.exists(state), name)
+
+    def test_watermark_regression_exits_1_and_keeps_state(self):
+        state = os.path.join(self.dir, "window")
+        self.run_cli(json.dumps({"events": [], "watermark": 8}), state)
+        path = os.path.join(state, "window.json")
+        before = open(path, "rb").read()
+        result = self.run_cli(
+            json.dumps({"events": [], "watermark": 7}), state
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith("event batch failed"))
+        self.assertEqual(open(path, "rb").read(), before)
+
+    def test_failure_keeps_old_state_byte_for_byte(self):
+        state = os.path.join(self.dir, "window")
+        self.run_cli(json.dumps({"events": [{"key": "keep", "timestamp": 0}],
+                                 "watermark": 0}), state)
+        path = os.path.join(state, "window.json")
+        before = open(path, "rb").read()
+        result = self.run_cli("{not json", state)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(open(path, "rb").read(), before)
+
+    def test_corrupt_state_exits_1_with_event_batch_failed(self):
+        state = os.path.join(self.dir, "broken")
+        os.makedirs(state)
+        with open(os.path.join(state, "window.json"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("{broken")
+        result = self.run_cli(
+            json.dumps({"events": [{"key": "a", "timestamp": 0}],
+                        "watermark": 0}),
+            state,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith("event batch failed"))
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+
+    def test_operand_is_a_usage_error_exit_2(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", os.path.join(self.dir, "w"), "observe-events", "x"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("usage", result.stderr.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
