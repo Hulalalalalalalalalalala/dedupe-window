@@ -35,8 +35,9 @@ still read, upgraded in memory and rewritten in the current format on the
 next commit.  A document without a version, with an unknown version, or
 left in a half-migrated shape raises ``ValueError``.
 
-Read calls never take the lock.  ``keys``, ``seen``, ``stats`` and
-``export`` open the data file independently of any writer, so a commit or a
+Read calls never take the lock.  ``keys``, ``seen``, ``stats``,
+``probe_many`` and ``export`` open the data file independently of any
+writer, so a commit or a
 compaction in progress neither blocks them nor leaks a half-written state:
 a reader always observes one whole committed prefix and reports exactly
 that commit -- its key order, counts and current time together, never a
@@ -86,6 +87,14 @@ _EXPORT_FORMAT = "dedupe-window-export"
 # successful commit; a replay never refreshes an entry's position.
 _RECEIPT_LIMIT = 128
 
+# Batch membership probes layer a deterministic bloom index over the exact
+# retained set.  The bounds keep the bit table small (never more than
+# ceil(bits/8) bytes) and the hash count cheap.
+_PROBE_DEFAULT_BITS = 8192
+_PROBE_DEFAULT_HASHES = 4
+_PROBE_MAX_BITS = 1 << 20
+_PROBE_MAX_HASHES = 16
+
 
 def _is_number(value):
     """Numbers are ints or floats; booleans do not count."""
@@ -118,6 +127,35 @@ def _canonical(body):
 
 def _checksum(body):
     return hashlib.sha256(_canonical(body)).hexdigest()
+
+
+def _bloom_positions(key, bits, hashes):
+    """Bloom positions for ``key`` from sha256 double hashing.
+
+    The digest is a pure function of the key's UTF-8 bytes, so the same
+    retained set and parameters produce the same positive/negative answers
+    in every process, across restarts.
+    """
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    first = int.from_bytes(digest[:16], "big")
+    second = int.from_bytes(digest[16:], "big")
+    return [(first + i * second) % bits for i in range(hashes)]
+
+
+def _bloom_build(keys, bits, hashes):
+    """A bloom table of exactly ceil(bits/8) bytes over ``keys``."""
+    table = bytearray((bits + 7) // 8)
+    for key in keys:
+        for pos in _bloom_positions(key, bits, hashes):
+            table[pos >> 3] |= 1 << (pos & 7)
+    return table
+
+
+def _bloom_might_contain(table, key, bits, hashes):
+    return all(
+        table[pos >> 3] & (1 << (pos & 7))
+        for pos in _bloom_positions(key, bits, hashes)
+    )
 
 
 def _stamp_of(path):
@@ -1120,6 +1158,11 @@ def _parse_state_file(path):
         raise
     except OSError as exc:
         raise ValueError(f"state file cannot be read: {exc}") from exc
+    return _parse_state_bytes(raw)
+
+
+def _parse_state_bytes(raw):
+    """Verify and replay one whole state file's contents (any version)."""
     text = _decode(raw)
     try:
         document = json.loads(text)
@@ -1175,6 +1218,15 @@ def _parse_tip_state(path):
         raise
     except OSError as exc:
         raise ValueError(f"state file cannot be read: {exc}") from exc
+    return _parse_tip_bytes(raw)
+
+
+def _parse_tip_bytes(raw):
+    """Reconstruct the latest committed state from one file's contents.
+
+    Same replay strategy as :func:`_parse_tip_state`, but takes the bytes the
+    caller already read, so the caller decides how read failures surface.
+    """
     text = _decode(raw)
     try:
         document = json.loads(text)
@@ -1182,7 +1234,7 @@ def _parse_tip_state(path):
         document = None
     if document is not None:
         # One whole-state object: the file's single record, parse it fully.
-        return _parse_state_file(path)
+        return _parse_state_bytes(raw)
     lines = _split_lines(text)
     if not lines:
         raise ValueError("state file is not valid JSON: the file is empty")
@@ -1836,6 +1888,98 @@ class Window:
             "retained": len(snapshot["entries"]),
             "admitted": snapshot["admitted"],
             "expired": snapshot["expired"],
+        }
+
+    def probe_many(self, keys, bits=_PROBE_DEFAULT_BITS,
+                   hashes=_PROBE_DEFAULT_HASHES):
+        """Probe a batch of keys for membership in one committed state.
+
+        Returns a report dict.  ``results`` holds one exact membership
+        boolean per input key in input order: duplicates are answered
+        separately and keys compare as raw strings, so the empty string
+        and non-ASCII keys need no special casing.  ``seq`` is the commit
+        the answers come from (0 when nothing is committed yet) and
+        ``queries`` the number of input keys.  ``bloom_positive`` counts
+        the keys a bloom index over the retained keys could not rule out,
+        ``matches`` the keys exactly retained, ``false_positives`` the
+        positives that missed, ``hit_rate`` is ``matches / queries`` and
+        ``false_positive_rate`` is ``false_positives / (queries -
+        matches)``; each ratio is 0 when its denominator is 0.
+
+        The bloom index is built from the retained keys of the same single
+        committed state the exact answers come from, and the read takes no
+        lock, so a commit in progress neither blocks the probe nor splits
+        it across two commits, and a commit, eviction or restore by
+        another process is reflected in the next call.  A bloom negative
+        is definitive; a positive is always rechecked against the exact
+        set, so a hash collision can only add to ``false_positives``,
+        never change ``results``.  The index occupies at most
+        ``ceil(bits / 8)`` bytes and hashes deterministically, so the same
+        retained set and parameters give the same positives in every
+        process.
+
+        All argument validation completes before the state is read:
+        ``keys`` must be a list of strings and ``bits``/``hashes`` must be
+        non-boolean integers, a wrong type raising ``TypeError``; ``bits``
+        outside 1..1048576 or ``hashes`` outside 1..16 raises
+        ``ValueError``.  An empty list still reads the snapshot and
+        reports zero-query statistics.  A missing state file is the empty
+        window; a recoverable uncommitted tail is ignored as elsewhere;
+        any other corruption or a settings mismatch raises ``ValueError``
+        and any other read failure raises ``OSError``.  The probe is a
+        pure read: it creates nothing and changes no state, counter or
+        receipt.
+        """
+        if not isinstance(keys, list):
+            raise TypeError("keys must be a list of strings")
+        if not all(isinstance(key, str) for key in keys):
+            raise TypeError("keys must be a list of strings")
+        if not isinstance(bits, int) or isinstance(bits, bool):
+            raise TypeError("bits must be an integer")
+        if not 1 <= bits <= _PROBE_MAX_BITS:
+            raise ValueError(f"bits must be between 1 and {_PROBE_MAX_BITS}")
+        if not isinstance(hashes, int) or isinstance(hashes, bool):
+            raise TypeError("hashes must be an integer")
+        if not 1 <= hashes <= _PROBE_MAX_HASHES:
+            raise ValueError(f"hashes must be between 1 and {_PROBE_MAX_HASHES}")
+        path = os.path.join(self._state_dir, _STATE_FILE)
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            # Nothing committed yet: probe the empty window at commit 0.
+            entries, seq = [], 0
+        else:
+            parsed = _parse_tip_bytes(raw)
+            if parsed.span != self._span or parsed.capacity != self._capacity:
+                raise ValueError("state file settings do not match this window")
+            entries, seq = parsed.entries, parsed.seq
+        retained = {key for key, _ in entries}
+        table = _bloom_build(retained, bits, hashes)
+        results = []
+        bloom_positive = 0
+        matches = 0
+        for key in keys:
+            hit = False
+            if _bloom_might_contain(table, key, bits, hashes):
+                # A bloom positive is only a hint; the exact set decides.
+                bloom_positive += 1
+                hit = key in retained
+            if hit:
+                matches += 1
+            results.append(hit)
+        false_positives = bloom_positive - matches
+        queries = len(keys)
+        misses = queries - matches
+        return {
+            "results": results,
+            "seq": seq,
+            "queries": queries,
+            "bloom_positive": bloom_positive,
+            "matches": matches,
+            "false_positives": false_positives,
+            "hit_rate": matches / queries if queries else 0,
+            "false_positive_rate": false_positives / misses if misses else 0,
         }
 
     def export(self, seq):

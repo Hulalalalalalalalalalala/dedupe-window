@@ -2404,5 +2404,321 @@ class CliDeliverEventsTests(unittest.TestCase):
         self.assertEqual(window._seq, 1)
 
 
+class ProbeManyTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.window = Window(self.dir, 10, 3)
+
+    def test_report_fields_and_order(self):
+        report = self.window.probe_many(["a"])
+        self.assertEqual(
+            list(report),
+            ["results", "seq", "queries", "bloom_positive", "matches",
+             "false_positives", "hit_rate", "false_positive_rate"],
+        )
+
+    def test_results_align_with_input_and_duplicates_counted(self):
+        self.window.observe("a")
+        self.window.observe("b")
+        report = self.window.probe_many(["a", "x", "b", "a"])
+        self.assertEqual(report["results"], [True, False, True, True])
+        self.assertEqual(report["queries"], 4)
+        self.assertEqual(report["matches"], 3)
+        self.assertEqual(report["seq"], 2)
+        self.assertEqual(report["hit_rate"], 3 / 4)
+
+    def test_empty_string_and_cjk_keys(self):
+        self.window.observe("")
+        self.window.observe("中文")
+        report = self.window.probe_many(["", "中文", "中 文", "a"])
+        self.assertEqual(report["results"], [True, True, False, False])
+
+    def test_collisions_never_change_results(self):
+        # One single bloom bit forces every key to collide; the exact set
+        # still decides every answer and the misses show up as false
+        # positives only.
+        self.window.observe("a")
+        report = self.window.probe_many(["a", "b", "c"], bits=1, hashes=1)
+        self.assertEqual(report["results"], [True, False, False])
+        self.assertEqual(report["bloom_positive"], 3)
+        self.assertEqual(report["matches"], 1)
+        self.assertEqual(report["false_positives"], 2)
+        self.assertEqual(report["false_positive_rate"], 1.0)
+
+    def test_bloom_negative_is_definitive(self):
+        for key in "abc":
+            self.window.observe(key)
+        report = self.window.probe_many(["a", "b", "c"])
+        self.assertEqual(report["results"], [True, True, True])
+        self.assertEqual(report["false_positives"], 0)
+        self.assertEqual(report["hit_rate"], 1.0)
+        self.assertEqual(report["false_positive_rate"], 0)
+
+    def test_zero_denominators_report_zero(self):
+        self.window.observe("a")
+        empty = self.window.probe_many([])
+        self.assertEqual(empty["queries"], 0)
+        self.assertEqual(empty["hit_rate"], 0)
+        self.assertEqual(empty["false_positive_rate"], 0)
+        hits_only = self.window.probe_many(["a", "a"])
+        self.assertEqual(hits_only["hit_rate"], 1.0)
+        self.assertEqual(hits_only["false_positive_rate"], 0)
+
+    def test_empty_list_still_reads_the_snapshot(self):
+        self.window.observe("a")
+        self.window.observe("b")
+        report = self.window.probe_many([])
+        self.assertEqual(report["results"], [])
+        self.assertEqual(report["seq"], 2)
+        # A corrupt state is reported even for an empty query list.
+        path = os.path.join(self.dir, "window.json")
+        with open(path, "a") as fh:
+            fh.write('{"kind":"delta","broken":1}\n{"kind":"delta","x":2}\n')
+        with self.assertRaises(ValueError):
+            self.window.probe_many([])
+
+    def test_missing_file_is_the_empty_window(self):
+        report = self.window.probe_many(["a", "b"])
+        self.assertEqual(report["results"], [False, False])
+        self.assertEqual(report["seq"], 0)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "window.json")))
+
+    def test_later_commits_evictions_and_restores_are_seen(self):
+        self.window.observe("a")
+        self.window.observe("b")
+        other = Window(self.dir, 10, 3)
+        other.observe("c")
+        other.observe("d")  # capacity 3: evicts "a"
+        report = self.window.probe_many(["a", "b", "c", "d"])
+        self.assertEqual(report["results"], [False, True, True, True])
+        self.assertEqual(report["seq"], 4)
+        document = other.export(2)
+        other.restore(document)
+        report = self.window.probe_many(["a", "b", "c", "d"])
+        self.assertEqual(report["results"], [True, True, False, False])
+        self.assertEqual(report["seq"], 2)
+
+    def test_probe_creates_nothing_and_changes_nothing(self):
+        self.window.observe("a")
+        path = os.path.join(self.dir, "window.json")
+        before = open(path, "rb").read()
+        self.window.probe_many(["a", "b"])
+        self.assertEqual(open(path, "rb").read(), before)
+        stats = self.window.stats()
+        self.assertEqual((stats["admitted"], stats["expired"]), (1, 0))
+        fresh = Window(os.path.join(self.dir, "never"), 10, 3)
+        fresh.probe_many(["a"])
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "never")))
+
+    def test_validation_runs_before_the_state_is_read(self):
+        path = os.path.join(self.dir, "window.json")
+        os.makedirs(self.dir, exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("{broken")
+        for call in (
+            lambda: self.window.probe_many("a"),
+            lambda: self.window.probe_many(["a", 1]),
+            lambda: self.window.probe_many([], bits=True),
+            lambda: self.window.probe_many([], bits=0),
+            lambda: self.window.probe_many([], hashes=1.5),
+            lambda: self.window.probe_many([], hashes=17),
+        ):
+            with self.assertRaises((TypeError, ValueError)) as caught:
+                call()
+            # The complaint is about the arguments, not the corrupt file.
+            self.assertNotIn("state file", str(caught.exception))
+
+    def test_type_and_range_validation(self):
+        for keys in ("a", ("a",), None, 1, ["a", None], ["a", True]):
+            with self.assertRaises(TypeError):
+                self.window.probe_many(keys)
+        for bits in (True, 1.5, "8192", None):
+            with self.assertRaises(TypeError):
+                self.window.probe_many([], bits=bits)
+        for bits in (0, -1, 1048577):
+            with self.assertRaises(ValueError):
+                self.window.probe_many([], bits=bits)
+        for hashes in (True, 2.0, "4", None):
+            with self.assertRaises(TypeError):
+                self.window.probe_many([], hashes=hashes)
+        for hashes in (0, -1, 17):
+            with self.assertRaises(ValueError):
+                self.window.probe_many([], hashes=hashes)
+        # The boundaries themselves are valid.
+        self.window.probe_many([], bits=1, hashes=1)
+        self.window.probe_many([], bits=1048576, hashes=16)
+
+    def test_corrupt_state_and_settings_mismatch_raise_value_error(self):
+        self.window.observe("a")
+        with self.assertRaises(ValueError):
+            Window(self.dir, 99, 3).probe_many(["a"])
+        path = os.path.join(self.dir, "window.json")
+        with open(path, "a") as fh:
+            fh.write('{"kind":"delta","broken":1}\n{"kind":"delta","x":2}\n')
+        with self.assertRaises(ValueError):
+            self.window.probe_many(["a"])
+
+    def test_torn_tail_is_ignored(self):
+        self.window.observe("a")
+        path = os.path.join(self.dir, "window.json")
+        with open(path, "ab") as fh:
+            fh.write(b'{"kind":"delta","seq":2,"pre')
+        report = self.window.probe_many(["a"])
+        self.assertEqual(report["results"], [True])
+        self.assertEqual(report["seq"], 1)
+
+    def test_bit_storage_bound(self):
+        from dedupe_window.window import _bloom_build
+        for bits in (1, 7, 8, 9, 8192, 1048576):
+            table = _bloom_build(["a", "b"], bits, 4)
+            self.assertEqual(len(table), (bits + 7) // 8)
+
+    def test_positives_are_deterministic_across_processes(self):
+        for key in ("alpha", "beta", "gamma"):
+            self.window.observe(key)
+        script = textwrap.dedent("""
+            import sys
+            from dedupe_window import Window
+            report = Window(sys.argv[1], 10, 3).probe_many(
+                ["alpha", "delta", "epsilon"], bits=16, hashes=2)
+            print(report["bloom_positive"], report["results"])
+        """)
+        env = dict(os.environ,
+                   PYTHONPATH=_REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
+        outs = [
+            subprocess.run([sys.executable, "-c", script, self.dir], env=env,
+                           capture_output=True, text=True, check=True).stdout
+            for _ in range(2)
+        ]
+        self.assertEqual(outs[0], outs[1])
+        self.assertIn("[True, False, False]", outs[0])
+
+
+class CliProbeBatchTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def run_cli(self, payload, *args):
+        state = args[0] if args else os.path.join(self.dir, "window")
+        return subprocess.run(
+            [sys.executable, "-m", "dedupe_window", "--state", state,
+             "probe-batch"],
+            capture_output=True, text=True, input=payload,
+        )
+
+    def seed(self, state, *keys):
+        for key in keys:
+            subprocess.run(
+                [sys.executable, "-m", "dedupe_window", "--state", state,
+                 "observe", key],
+                capture_output=True, text=True, check=True,
+            )
+
+    def test_probe_flow(self):
+        state = os.path.join(self.dir, "window")
+        self.seed(state, "a", "中文")
+        result = self.run_cli(json.dumps({"keys": ["a", "b", "中文", "a"]}), state)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["results"], [True, False, True, True])
+        self.assertEqual(report["seq"], 2)
+        self.assertEqual(report["queries"], 4)
+        self.assertEqual(report["matches"], 3)
+        self.assertEqual(result.stdout, json.dumps(report, separators=(",", ":")) + "\n")
+
+    def test_optional_fields_and_defaults(self):
+        state = os.path.join(self.dir, "window")
+        self.seed(state, "a")
+        defaulted = self.run_cli(json.dumps({"keys": ["a", "b"]}), state)
+        explicit = self.run_cli(
+            json.dumps({"keys": ["a", "b"], "bits": 8192, "hashes": 4}), state)
+        self.assertEqual(defaulted.returncode, 0, defaulted.stderr)
+        self.assertEqual(defaulted.stdout, explicit.stdout)
+        tiny = self.run_cli(json.dumps({"keys": ["a", "b"], "bits": 1, "hashes": 1}), state)
+        report = json.loads(tiny.stdout)
+        self.assertEqual(report["results"], [True, False])
+        self.assertEqual(report["bloom_positive"], 2)
+        self.assertEqual(report["false_positives"], 1)
+
+    def test_extra_fields_ignored_and_whitespace_allowed(self):
+        state = os.path.join(self.dir, "window")
+        self.seed(state, "a")
+        result = self.run_cli(' \n {"keys": ["a"], "other": [1, 2]} \t\n', state)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["results"], [True])
+
+    def test_success_creates_nothing_and_changes_nothing(self):
+        state = os.path.join(self.dir, "window")
+        self.seed(state, "a")
+        path = os.path.join(state, "window.json")
+        before = open(path, "rb").read()
+        result = self.run_cli(json.dumps({"keys": ["a", "b"]}), state)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(open(path, "rb").read(), before)
+        missing = os.path.join(self.dir, "never")
+        result = self.run_cli(json.dumps({"keys": ["a"]}), missing)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["seq"], 0)
+        self.assertFalse(os.path.exists(missing))
+
+    def test_failures_exit_1_one_line_prefix_and_empty_stdout(self):
+        cases = {
+            "empty input": "",
+            "whitespace only": "  \n\t",
+            "not json": "{not json",
+            "json array": json.dumps(["a"]),
+            "json string": json.dumps("a"),
+            "missing keys": json.dumps({"bits": 4}),
+            "keys not a list": json.dumps({"keys": "a"}),
+            "non-string element": json.dumps({"keys": ["a", 1]}),
+            "bool element": json.dumps({"keys": [True]}),
+            "bits wrong type": json.dumps({"keys": [], "bits": "8"}),
+            "bits bool": json.dumps({"keys": [], "bits": True}),
+            "bits out of range": json.dumps({"keys": [], "bits": 0}),
+            "bits too large": json.dumps({"keys": [], "bits": 1048577}),
+            "hashes wrong type": json.dumps({"keys": [], "hashes": 1.5}),
+            "hashes out of range": json.dumps({"keys": [], "hashes": 17}),
+            "trailing junk": '{"keys": []} junk',
+        }
+        for name, payload in cases.items():
+            state = os.path.join(self.dir, "case_" + name.replace(" ", "_"))
+            result = self.run_cli(payload, state)
+            self.assertEqual(result.returncode, 1, name)
+            self.assertEqual(result.stdout, "", name)
+            self.assertTrue(result.stderr.startswith("probe failed"), name)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, name)
+            self.assertFalse(os.path.exists(state), name)
+
+    def test_corrupt_state_exits_1_with_probe_failed(self):
+        state = os.path.join(self.dir, "broken")
+        os.makedirs(state)
+        with open(os.path.join(state, "window.json"), "w", encoding="utf-8") as fh:
+            fh.write("{broken")
+        result = self.run_cli(json.dumps({"keys": ["a"]}), state)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith("probe failed"))
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+
+    def test_failure_keeps_old_state_byte_for_byte(self):
+        state = os.path.join(self.dir, "window")
+        self.seed(state, "keep")
+        path = os.path.join(state, "window.json")
+        before = open(path, "rb").read()
+        result = self.run_cli("{not json", state)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(open(path, "rb").read(), before)
+
+    def test_operand_is_a_usage_error_exit_2(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", os.path.join(self.dir, "w"), "probe-batch", "x"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("usage", result.stderr.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
