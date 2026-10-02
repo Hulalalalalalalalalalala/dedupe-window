@@ -20,6 +20,7 @@ Python 3.11 or newer. Standard library only.
     python3 -m dedupe_window --state ./window observe-batch
     python3 -m dedupe_window --state ./window observe-events
     python3 -m dedupe_window --state ./window deliver-events
+    python3 -m dedupe_window --state ./window probe-batch
 
 `observe-batch` reads one JSON array of strings from standard input (surrounding
 whitespace is allowed) and writes one compact JSON line of booleans, one per
@@ -94,6 +95,19 @@ state or an I/O failure exits 1 with one `delivery failed` line on standard
 error and an empty standard output; a wrong number of command arguments exits
 2 with the usage message.
 
+`probe-batch` checks a batch of keys for membership without recording
+anything. It reads one JSON object from standard input, e.g.
+`{"keys":["a","b"],"bits":8192,"hashes":4}` (`bits` and `hashes` are optional
+and default to 8192 and 4; extra fields are ignored), and writes one compact
+JSON line with the same fields `Window.probe_many` returns: `results` (one
+exact-membership boolean per input key, in input order), `seq`, `queries`,
+`bloom_positive`, `matches`, `false_positives`, `hit_rate` and
+`false_positive_rate`. It is a pure read: it never creates the directory,
+never modifies the state file and never waits on a writer. Bad JSON, a
+missing `keys` field, an invalid parameter or a state read failure exits 1
+with one `probe failed` line on standard error and an empty standard output;
+a wrong number of command arguments exits 2 with the usage message.
+
 `export <seq>` writes the complete self-checking document of commit `seq`
 (numbered from 1) as one JSON object on standard output, without changing the
 state. `restore` reads exactly one such document from standard input and
@@ -122,6 +136,7 @@ has never committed answer from the empty state and leave the filesystem alone.
 - `observe_events(events, watermark) -> list[str]` processes one out-of-order event batch atomically. `events` is a list of objects with string `key` and numeric `timestamp`; it returns one `"admitted"`/`"duplicate"`/`"late"` string per event in input order. The batch first moves time to `watermark` and expires the span, then classifies each event: `watermark - timestamp > span` is `late` (checked before duplicates; the boundary is valid), a retained key is `duplicate` (no time/order refresh), anything else is `admitted` at the event timestamp. Keys stay ordered by first sighting, ties by admission order; a full window evicts the current oldest key, which can be readmitted later in the same batch. Only admissions grow `admitted` and only time expiry grows `expired`; one commit is added when the watermark moves, an expiry occurs or an event is admitted (an empty list still advances/expires). A wrong argument type raises `TypeError`; a missing field, non-finite or negative time, future event, watermark regression, corrupt state or settings mismatch raises `ValueError`; either leaves the window state and any existing file unchanged and a failed validation creates no directory.
 - `deliver_events(delivery_id, events, watermark) -> list[str]` idempotently delivers one event-time batch. The first successful call for a `delivery_id` follows the exact classification, eviction and counter rules of `observe_events` and commits the event changes together with one receipt (an empty or all-duplicate batch also commits). The newest 128 distinct identifiers are retained in first successful commit order; the oldest is evicted past that limit, a replay never refreshes an entry, and time advancement or key expiry never evicts one. A retained identifier returns the original classifications only when the watermark and the ordered `key`/`timestamp` contents match (extra event fields are ignored; numerically equal ints and floats are equivalent); the replay changes no time, counters or file and succeeds even when its watermark lags the current time. A content mismatch raises `ValueError`. An evicted identifier is handled as a new request, where a watermark behind the current time raises `ValueError`. A non-string `delivery_id` raises `TypeError` and an empty one raises `ValueError`; the remaining validation matches `observe_events` and completes before any filesystem access, and a corrupt state or settings mismatch raises `ValueError` without creating a directory or altering a file.
 - `seen(key) -> bool` reports membership without recording anything.
+- `probe_many(keys, bits=8192, hashes=4) -> dict` checks a list of string keys for membership without recording anything. The returned dict holds `results` (one exact-membership boolean per input item in input order, duplicates counted separately, keys compared as raw strings) plus statistics from the same single committed state: `seq` (0 when nothing is committed), `queries`, `bloom_positive`, `matches`, `false_positives`, `hit_rate` (`matches / queries`) and `false_positive_rate` (`false_positives / (queries - matches)`); a rate with a zero denominator is 0. A bloom layer of `bits` bits (at most `ceil(bits / 8)` bytes) and `hashes` hash functions is rebuilt from the currently retained keys on every call; a bloom negative proves absence and every positive is double-checked exactly, so a collision never changes `results`. The position mapping is deterministic, so the same retained set and parameters give the same positives in every process. `bits` must be an integer from 1 to 1048576 and `hashes` from 1 to 16 (booleans rejected): wrong types raise `TypeError`, out-of-range values `ValueError`, and all validation completes before any state is read. A missing data file is probed as the empty window; a corrupt file or settings mismatch raises `ValueError`; other read failures raise `OSError`. The call creates nothing and modifies nothing.
 - `advance(now) -> int` drops everything older than the span and returns how many keys went.
 - `keys() -> list[str]` retained keys, oldest sighting first.
 - `stats() -> dict` reports span, capacity, retained, admitted and expired counts.
@@ -129,7 +144,7 @@ has never committed answer from the empty state and leave the filesystem alone.
 - `restore(document) -> None` atomically resets the whole window to an exported state; key order, counts, time and settings match the document and later commits continue from the exported commit's successor. Anything that is not an export document raises `TypeError`; a missing/mistyped field or a bad checksum raises `ValueError`.
 - `save() -> None` and `load() -> None` persist the window and re-read it before replacing memory.
 
-`keys`, `seen`, `stats` and `export` are readers: they never take the lock, so a
+`keys`, `seen`, `stats`, `probe_many` and `export` are readers: they never take the lock, so a
 commit or background compaction in progress neither waits for them nor blocks
 them, and they never return a half-written state. Each read reports exactly one
 complete commit — its key order, counts and current time together, never a mix

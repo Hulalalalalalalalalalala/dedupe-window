@@ -35,8 +35,9 @@ still read, upgraded in memory and rewritten in the current format on the
 next commit.  A document without a version, with an unknown version, or
 left in a half-migrated shape raises ``ValueError``.
 
-Read calls never take the lock.  ``keys``, ``seen``, ``stats`` and
-``export`` open the data file independently of any writer, so a commit or a
+Read calls never take the lock.  ``keys``, ``seen``, ``stats``,
+``probe_many`` and ``export`` open the data file independently of any
+writer, so a commit or a
 compaction in progress neither blocks them nor leaks a half-written state:
 a reader always observes one whole committed prefix and reports exactly
 that commit -- its key order, counts and current time together, never a
@@ -86,6 +87,13 @@ _EXPORT_FORMAT = "dedupe-window-export"
 # successful commit; a replay never refreshes an entry's position.
 _RECEIPT_LIMIT = 128
 
+# The bloom layer of :meth:`Window.probe_many` sizes its bit vector and hash
+# count within these bounds.
+_PROBE_DEFAULT_BITS = 8192
+_PROBE_DEFAULT_HASHES = 4
+_PROBE_MAX_BITS = 1048576
+_PROBE_MAX_HASHES = 16
+
 
 def _is_number(value):
     """Numbers are ints or floats; booleans do not count."""
@@ -105,6 +113,32 @@ def _is_count(value):
 def _check_key(key):
     if not isinstance(key, str):
         raise TypeError("key must be a string")
+
+
+def _check_probe_params(bits, hashes):
+    """Validate bloom sizing: non-boolean ints within the allowed ranges."""
+    if not isinstance(bits, int) or isinstance(bits, bool):
+        raise TypeError("bits must be an integer")
+    if not isinstance(hashes, int) or isinstance(hashes, bool):
+        raise TypeError("hashes must be an integer")
+    if not 1 <= bits <= _PROBE_MAX_BITS:
+        raise ValueError("bits must be between 1 and 1048576")
+    if not 1 <= hashes <= _PROBE_MAX_HASHES:
+        raise ValueError("hashes must be between 1 and 16")
+
+
+def _bloom_positions(key, bits, hashes):
+    """The ``hashes`` bit positions of ``key`` in a ``bits``-wide vector.
+
+    Derived by double hashing from the SHA-256 of the key's UTF-8 bytes, so
+    the same key, bit width and hash count map to the same positions in
+    every process.
+    """
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    first = int.from_bytes(digest[:8], "big")
+    second = int.from_bytes(digest[8:16], "big")
+    for round_ in range(hashes):
+        yield (first + round_ * second) % bits
 
 
 def _canonical(body):
@@ -1120,7 +1154,11 @@ def _parse_state_file(path):
         raise
     except OSError as exc:
         raise ValueError(f"state file cannot be read: {exc}") from exc
-    text = _decode(raw)
+    return _parse_state_text(_decode(raw), len(raw))
+
+
+def _parse_state_text(text, size):
+    """Parse and verify one whole state text; ``size`` is its byte length."""
     try:
         document = json.loads(text)
     except json.JSONDecodeError:
@@ -1132,9 +1170,9 @@ def _parse_state_file(path):
             raise ValueError("state file must contain a JSON object")
         version = _version_of(document)
         if version == 1:
-            return _parse_v1(document, len(raw))
+            return _parse_v1(document, size)
         if version == 2:
-            return _parse_v2_single(document, len(raw))
+            return _parse_v2_single(document, size)
         if version == 3:
             info = _v3_anchor_info(document, allow_base=True)
             if info["kind"] != "base":
@@ -1150,10 +1188,10 @@ def _parse_state_file(path):
                 receipts=info["receipts"],
                 seq=info["seq"],
                 tip=info["tip"],
-                anchor_bytes=len(raw),
+                anchor_bytes=size,
                 delta_bytes=0,
                 delta_count=0,
-                good_offset=len(raw),
+                good_offset=size,
             )
         raise ValueError("state file has an unsupported version")
     return _parse_log_text(text)
@@ -1175,14 +1213,18 @@ def _parse_tip_state(path):
         raise
     except OSError as exc:
         raise ValueError(f"state file cannot be read: {exc}") from exc
-    text = _decode(raw)
+    return _parse_tip_text(_decode(raw))
+
+
+def _parse_tip_text(text):
+    """The text half of :func:`_parse_tip_state`, for lock-free readers."""
     try:
         document = json.loads(text)
     except json.JSONDecodeError:
         document = None
     if document is not None:
         # One whole-state object: the file's single record, parse it fully.
-        return _parse_state_file(path)
+        return _parse_state_text(text, len(text.encode("utf-8")))
     lines = _split_lines(text)
     if not lines:
         raise ValueError("state file is not valid JSON: the file is empty")
@@ -1822,6 +1864,97 @@ class Window:
         """
         snapshot = self._committed_or_memory()
         return [key for key, _ in snapshot["entries"]]
+
+    def _probe_snapshot(self):
+        """Read the latest committed state for a probe, without the lock.
+
+        A missing data file means the empty window; a torn uncommitted tail
+        is ignored as everywhere else.  Corruption or a settings mismatch
+        raises ``ValueError``; any other read failure propagates as
+        ``OSError``.  Nothing is created or modified.
+        """
+        path = os.path.join(self._state_dir, _STATE_FILE)
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            return None
+        parsed = _parse_tip_text(_decode(raw))
+        if parsed.span != self._span or parsed.capacity != self._capacity:
+            raise ValueError("state file settings do not match this window")
+        return {"entries": parsed.entries, "seq": parsed.seq}
+
+    def probe_many(self, keys, bits=_PROBE_DEFAULT_BITS,
+                   hashes=_PROBE_DEFAULT_HASHES):
+        """Check a batch of keys for membership without recording anything.
+
+        ``keys`` must be a list of strings, compared as raw strings (empty
+        and non-ASCII keys included); the returned dict's ``results`` list
+        holds one exact-membership boolean per input item in input order,
+        duplicates counted separately.  A bloom layer of ``bits`` bits and
+        ``hashes`` hash functions is rebuilt from the retained keys of the
+        same single committed state the exact answers come from -- one whole
+        commit, read without waiting on any write lock -- and the remaining
+        fields describe that commit: ``seq`` (0 when nothing is committed),
+        ``queries``, ``bloom_positive``, ``matches``, ``false_positives``
+        (bloom-positive but not retained), ``hit_rate``
+        (``matches / queries``) and ``false_positive_rate``
+        (``false_positives / (queries - matches)``); a rate whose
+        denominator is zero is reported as 0.  A bloom negative proves
+        absence; every positive is double-checked against the exact set, so
+        a hash collision never changes ``results``.
+
+        The bit vector occupies at most ``ceil(bits / 8)`` bytes and the
+        position mapping is deterministic, so the same retained set and
+        parameters produce the same positives in every process.  ``bits``
+        must be an integer from 1 to 1048576 and ``hashes`` from 1 to 16;
+        booleans and other types raise ``TypeError``, out-of-range values
+        ``ValueError``.  All validation completes before any state is read.
+
+        Like the other readers this creates nothing and modifies nothing: a
+        missing data file is probed as the empty window, a torn uncommitted
+        tail is ignored, a corrupt file or a settings mismatch raises
+        ``ValueError`` and any other read failure raises ``OSError``.
+        """
+        if not isinstance(keys, list):
+            raise TypeError("keys must be a list of strings")
+        if not all(isinstance(key, str) for key in keys):
+            raise TypeError("keys must be a list of strings")
+        _check_probe_params(bits, hashes)
+        snapshot = self._probe_snapshot()
+        entries = snapshot["entries"] if snapshot is not None else []
+        seq = snapshot["seq"] if snapshot is not None else 0
+        retained = {key for key, _ in entries}
+        storage = bytearray((bits + 7) // 8)
+        for key in retained:
+            for pos in _bloom_positions(key, bits, hashes):
+                storage[pos >> 3] |= 1 << (pos & 7)
+        results = []
+        bloom_positive = 0
+        matches = 0
+        for key in keys:
+            if all(
+                storage[pos >> 3] & (1 << (pos & 7))
+                for pos in _bloom_positions(key, bits, hashes)
+            ):
+                bloom_positive += 1
+            hit = key in retained
+            if hit:
+                matches += 1
+            results.append(hit)
+        queries = len(keys)
+        false_positives = bloom_positive - matches
+        misses = queries - matches
+        return {
+            "results": results,
+            "seq": seq,
+            "queries": queries,
+            "bloom_positive": bloom_positive,
+            "matches": matches,
+            "false_positives": false_positives,
+            "hit_rate": matches / queries if queries else 0,
+            "false_positive_rate": false_positives / misses if misses else 0,
+        }
 
     def stats(self):
         """Span, capacity, retained, admitted and expired counts.

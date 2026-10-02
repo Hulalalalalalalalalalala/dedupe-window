@@ -16,7 +16,7 @@ DEFAULT_CAPACITY = 1024
 USAGE = (
     "usage: python3 -m dedupe_window --state <dir> "
     "{observe <key> | seen <key> | stats | export <seq> | restore"
-    " | observe-batch | observe-events | deliver-events}"
+    " | observe-batch | observe-events | deliver-events | probe-batch}"
 )
 
 # A decimal commit number: one or more decimal digits, optionally signed with
@@ -55,6 +55,11 @@ def _delivery_failed(reason):
     raise SystemExit(1)
 
 
+def _probe_failed(reason):
+    print(f"probe failed: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
 def _parse(argv):
     state = None
     rest = []
@@ -79,7 +84,7 @@ def _parse(argv):
         if len(operands) != 1:
             _usage()
     elif command in ("stats", "restore", "observe-batch", "observe-events",
-                     "deliver-events"):
+                     "deliver-events", "probe-batch"):
         if operands:
             _usage()
     else:
@@ -306,6 +311,52 @@ def _run_deliver_events(state):
     sys.stdout.write(json.dumps(kinds, separators=(",", ":")) + "\n")
 
 
+def _run_probe_batch(state):
+    """Probe a batch of keys read as one JSON object from stdin.
+
+    The input is exactly one JSON object holding a ``keys`` array of strings
+    plus optional ``bits`` and ``hashes`` sizing fields; extra fields are
+    ignored.  Input types and ranges are validated before any filesystem
+    call, so an invalid input creates no directory and leaves an existing
+    state byte for byte unchanged.  On success stdout holds one compact JSON
+    line with the same fields :meth:`Window.probe_many` returns.  Any
+    failure exits 1 with one ``probe failed`` line on stderr and an empty
+    stdout.
+    """
+    raw = sys.stdin.buffer.read()
+    try:
+        document = json.loads(raw)
+    except ValueError as exc:
+        # Covers an empty input, malformed JSON and trailing junk.
+        _probe_failed(f"input is not one JSON object: {exc}")
+    if not isinstance(document, dict) or "keys" not in document:
+        _probe_failed("input must be one JSON object with keys")
+    keys = document["keys"]
+    bits = document.get("bits", 8192)
+    hashes = document.get("hashes", 4)
+    if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+        _probe_failed("keys must be a JSON array of strings")
+    if not isinstance(bits, int) or isinstance(bits, bool):
+        _probe_failed("bits must be an integer")
+    if not isinstance(hashes, int) or isinstance(hashes, bool):
+        _probe_failed("hashes must be an integer")
+    if not 1 <= bits <= 1048576:
+        _probe_failed("bits must be between 1 and 1048576")
+    if not 1 <= hashes <= 16:
+        _probe_failed("hashes must be between 1 and 16")
+    # Pure read: never create the directory, never touch the data file.
+    path = os.path.join(state, "window.json")
+    span, capacity = DEFAULT_SPAN, DEFAULT_CAPACITY
+    try:
+        if os.path.exists(path):
+            span, capacity = read_settings(path)
+        window = Window(state, span, capacity)
+        report = window.probe_many(keys, bits=bits, hashes=hashes)
+    except (TypeError, ValueError, OSError) as exc:
+        _probe_failed(str(exc))
+    sys.stdout.write(json.dumps(report, separators=(",", ":")) + "\n")
+
+
 def _run_restore(state):
     """Reset the state atomically from exactly one JSON object on stdin.
 
@@ -364,6 +415,8 @@ def main(argv=None):
         _run_observe_events(state)
     elif command == "deliver-events":
         _run_deliver_events(state)
+    elif command == "probe-batch":
+        _run_probe_batch(state)
     else:
         # Pure read: never create the directory, never touch the data file.
         if not os.path.exists(path):
