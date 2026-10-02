@@ -2096,5 +2096,460 @@ class CliObserveEventsTests(unittest.TestCase):
         self.assertIn("usage", result.stderr.lower())
 
 
+class DeliverEventsTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def window(self, span=100000, capacity=10):
+        return Window(self.dir, span, capacity)
+
+    def test_first_delivery_matches_observe_events(self):
+        window = self.window()
+        kinds = window.deliver_events(
+            "d1",
+            [
+                {"key": "a", "timestamp": 0},
+                {"key": "b", "timestamp": 5},
+                {"key": "a", "timestamp": 2},
+            ],
+            10,
+        )
+        self.assertEqual(kinds, ["admitted", "admitted", "duplicate"])
+        stats = window.stats()
+        self.assertEqual((stats["retained"], stats["admitted"], stats["expired"]),
+                         (2, 2, 0))
+        self.assertEqual(window.keys(), ["a", "b"])
+        self.assertEqual(window._seq, 1)
+
+    def test_empty_and_all_duplicate_batches_commit(self):
+        window = self.window()
+        self.assertEqual(window.deliver_events("empty", [], 0), [])
+        self.assertEqual(window._seq, 1)
+        window.deliver_events("first", [{"key": "a", "timestamp": 1}], 1)
+        self.assertEqual(window._seq, 2)
+        self.assertEqual(
+            window.deliver_events("dup", [{"key": "a", "timestamp": 1}], 1),
+            ["duplicate"],
+        )
+        self.assertEqual(window._seq, 3)
+
+    def test_replay_returns_original_results_and_changes_nothing(self):
+        window = self.window()
+        events = [{"key": "a", "timestamp": 0}, {"key": "b", "timestamp": 5}]
+        first = window.deliver_events("d1", events, 10)
+        path = os.path.join(self.dir, "window.json")
+        before = open(path, "rb").read()
+        stats_before = window.stats()
+        replay = window.deliver_events("d1", events, 10)
+        self.assertEqual(replay, first)
+        self.assertEqual(open(path, "rb").read(), before)
+        self.assertEqual(window.stats(), stats_before)
+        self.assertEqual(window._seq, 1)
+
+    def test_replay_survives_reopen(self):
+        self.window().deliver_events(
+            "d1", [{"key": "a", "timestamp": 0}, {"key": "c", "timestamp": 3}], 5
+        )
+        window = self.window()
+        window.load()
+        self.assertEqual(
+            window.deliver_events(
+                "d1", [{"key": "a", "timestamp": 0}, {"key": "c", "timestamp": 3}], 5
+            ),
+            ["admitted", "admitted"],
+        )
+        self.assertEqual(window._seq, 1)
+
+    def test_replay_allows_lagging_watermark(self):
+        window = self.window()
+        first = window.deliver_events("d1", [{"key": "a", "timestamp": 0}], 10)
+        window.advance(50)
+        self.assertEqual(
+            window.deliver_events("d1", [{"key": "a", "timestamp": 0}], 10), first
+        )
+
+    def test_int_and_float_contents_are_equivalent(self):
+        window = self.window()
+        first = window.deliver_events("d1", [{"key": "a", "timestamp": 1}], 10)
+        replay = window.deliver_events("d1", [{"key": "a", "timestamp": 1.0}], 10.0)
+        self.assertEqual(replay, first)
+        self.assertEqual(window._seq, 1)
+
+    def test_same_id_with_different_content_conflicts(self):
+        window = self.window()
+        window.deliver_events("d1", [{"key": "a", "timestamp": 0}], 10)
+        with self.assertRaises(ValueError):
+            window.deliver_events("d1", [{"key": "b", "timestamp": 0}], 10)
+        with self.assertRaises(ValueError):
+            window.deliver_events("d1", [{"key": "a", "timestamp": 0}], 11)
+        with self.assertRaises(ValueError):
+            window.deliver_events(
+                "d1",
+                [{"key": "a", "timestamp": 0}, {"key": "a", "timestamp": 0}],
+                10,
+            )
+
+    def test_delivery_id_validation(self):
+        window = self.window()
+        with self.assertRaises(TypeError):
+            window.deliver_events(1, [], 0)
+        with self.assertRaises(TypeError):
+            window.deliver_events(None, [], 0)
+        with self.assertRaises(ValueError):
+            window.deliver_events("", [], 0)
+
+    def test_input_validation_matches_observe_events(self):
+        window = self.window()
+        with self.assertRaises(TypeError):
+            window.deliver_events("d", "not a list", 0)
+        with self.assertRaises(TypeError):
+            window.deliver_events("d", [], "0")
+        with self.assertRaises(ValueError):
+            window.deliver_events("d", [], -1)
+        with self.assertRaises(ValueError):
+            window.deliver_events("d", [{"key": "a"}], 0)
+        with self.assertRaises(TypeError):
+            window.deliver_events("d", [{"key": 1, "timestamp": 0}], 0)
+        with self.assertRaises(ValueError):
+            window.deliver_events("d", [{"key": "a", "timestamp": 6}], 5)
+
+    def test_validation_failure_creates_no_directory(self):
+        missing = os.path.join(self.dir, "never")
+        window = Window(missing, 100, 10)
+        with self.assertRaises(ValueError):
+            window.deliver_events("", [], 0)
+        with self.assertRaises(TypeError):
+            window.deliver_events("d", "junk", 0)
+        self.assertFalse(os.path.exists(missing))
+
+    def test_failed_delivery_keeps_state_byte_for_byte(self):
+        window = self.window()
+        window.deliver_events("d1", [{"key": "a", "timestamp": 0}], 10)
+        path = os.path.join(self.dir, "window.json")
+        before = open(path, "rb").read()
+        with self.assertRaises(ValueError):
+            window.deliver_events("d1", [{"key": "other", "timestamp": 0}], 10)
+        with self.assertRaises(ValueError):
+            window.deliver_events("d2", [{"key": "x", "timestamp": 99}], 5)
+        self.assertEqual(open(path, "rb").read(), before)
+
+    def test_new_id_with_regressed_watermark_raises(self):
+        window = self.window()
+        window.deliver_events("d1", [], 10)
+        with self.assertRaises(ValueError):
+            window.deliver_events("d2", [], 9)
+
+    def test_receipt_eviction_treats_old_id_as_new(self):
+        window = self.window()
+        for i in range(129):
+            window.deliver_events(f"id{i}", [], i)
+        # The first receipt was evicted by the 129th: id0 is a new request
+        # and its old watermark is now a regression.
+        with self.assertRaises(ValueError):
+            window.deliver_events("id0", [], 0)
+        # id1 is still retained and replays.
+        self.assertEqual(window.deliver_events("id1", [], 1), [])
+        # Eviction survives a reload.
+        again = self.window()
+        again.load()
+        with self.assertRaises(ValueError):
+            again.deliver_events("id0", [], 0)
+        self.assertEqual(again.deliver_events("id1", [], 1), [])
+
+    def test_time_and_key_eviction_do_not_retire_receipts(self):
+        window = self.window(span=10, capacity=1)
+        first = window.deliver_events("d1", [{"key": "a", "timestamp": 0}], 0)
+        window.deliver_events("d2", [{"key": "b", "timestamp": 1}], 1)
+        window.advance(100)  # expires every retained key
+        self.assertEqual(window.keys(), [])
+        self.assertEqual(
+            window.deliver_events("d1", [{"key": "a", "timestamp": 0}], 0), first
+        )
+
+    def test_export_restore_preserves_receipts(self):
+        window = self.window()
+        first = window.deliver_events(
+            "d1", [{"key": "a", "timestamp": 0}, {"key": "b", "timestamp": 2}], 5
+        )
+        document = window.export(window._seq)
+        self.assertIn("receipts", document)
+        restored_dir = tempfile.mkdtemp()
+        restored = Window(restored_dir, 1, 1)
+        restored.restore(document)
+        events = [{"key": "a", "timestamp": 0}, {"key": "b", "timestamp": 2}]
+        self.assertEqual(restored.deliver_events("d1", events, 5), first)
+        with self.assertRaises(ValueError):
+            restored.deliver_events("d1", [{"key": "a", "timestamp": 0}], 5)
+
+    def test_export_without_receipts_restores_with_none(self):
+        window = self.window()
+        window.observe_events([{"key": "a", "timestamp": 0}], 0)
+        document = window.export(window._seq)
+        self.assertNotIn("receipts", document)
+        restored_dir = tempfile.mkdtemp()
+        restored = Window(restored_dir, 1, 1)
+        restored.restore(document)
+        # No receipt was restored: the same delivery commits as a first one.
+        self.assertEqual(restored.deliver_events("d1", [], 0), [])
+        self.assertEqual(restored._seq, document["seq"] + 1)
+
+    def test_historical_exports_stay_identical(self):
+        window = self.window()
+        window.observe_events([{"key": "a", "timestamp": 0}], 0)
+        before = window.export(1)
+        window.deliver_events("d1", [{"key": "b", "timestamp": 1}], 5)
+        self.assertEqual(window.export(1), before)
+        self.assertNotIn("receipts", window.export(1))
+        self.assertIn("receipts", window.export(2))
+
+    def test_receipts_survive_compaction(self):
+        window = self.window()
+        window.deliver_events("seed", [{"key": "s", "timestamp": 0}], 0)
+        big = [{"key": f"k{i}", "timestamp": 0} for i in range(300)]
+        first = window.deliver_events("big", big, 0)  # one large delta
+        exported_before = window.export(2)
+        window.deliver_events("next", [{"key": "z", "timestamp": 1}], 1)
+        with open(os.path.join(self.dir, "window.json"), "rb") as fh:
+            kinds = [json.loads(line)["kind"] for line in fh.read().splitlines()]
+        self.assertIn("anchor", kinds)  # the large delta forced a compaction
+        self.assertEqual(window.export(2), exported_before)
+        self.assertEqual(window.deliver_events("big", big, 0), first)
+        again = self.window()
+        again.load()
+        self.assertEqual(again.deliver_events("big", big, 0), first)
+
+    def test_tampered_delivery_segment_is_detected_on_replay(self):
+        window = self.window()
+        window.deliver_events("d1", [{"key": "a", "timestamp": 0}], 5)
+        window.deliver_events("d2", [{"key": "b", "timestamp": 1}], 6)
+        path = os.path.join(self.dir, "window.json")
+        with open(path, "rb") as fh:
+            lines = fh.read().splitlines()
+        segment = json.loads(lines[-1])
+        self.assertEqual((segment["kind"], segment["op"]), ("delta", "delivery"))
+        segment["kinds"] = ["late"]  # forged result, checksum recomputed
+        del segment["checksum"]
+        body = json.dumps(segment, sort_keys=True, separators=(",", ":"))
+        segment["checksum"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        lines[-1] = json.dumps(
+            segment, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        with open(path, "wb") as fh:
+            # A dangling torn tail keeps the tampered segment off the last
+            # line, so it is validated rather than ignored as a torn tail.
+            fh.write(b"\n".join(lines) + b'\n{"kind":"delta",')
+        with self.assertRaises(ValueError):
+            self.window().load()
+
+    def test_malformed_snapshot_receipts_are_rejected(self):
+        window = self.window()
+        window.deliver_events("d1", [{"key": "a", "timestamp": 0}], 5)
+        path = os.path.join(self.dir, "window.json")
+        with open(path, "rb") as fh:
+            document = json.loads(fh.read())
+        document["receipts"].append(document["receipts"][0])  # duplicate id
+        del document["checksum"]
+        body = json.dumps(
+            {k: v for k, v in document.items()},
+            sort_keys=True, separators=(",", ":"),
+        )
+        document["checksum"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(document, fh)
+        with self.assertRaises(ValueError):
+            self.window().load()
+
+    def test_concurrent_same_delivery_commits_once(self):
+        script = _worker("""
+            import sys
+            from dedupe_window import Window
+            _, state = sys.argv[1], sys.argv[2]
+            w = Window(state, 100000, 100)
+            kinds = w.deliver_events(
+                "race", [{"key": "a", "timestamp": 0},
+                         {"key": "b", "timestamp": 1}], 5)
+            print(",".join(kinds))
+        """)
+        procs, results = self._run_workers(script, 6)
+        self.assertEqual([p.returncode for p in procs], [0] * 6)
+        outputs = [out.decode().strip() for out, _ in results]
+        self.assertEqual(outputs, ["admitted,admitted"] * 6)
+        window = Window(self.dir, 100000, 100)
+        window.load()
+        self.assertEqual(window._seq, 1)
+        self.assertEqual(window.stats()["admitted"], 2)
+
+    def _run_workers(self, script, count, *args):
+        env = dict(os.environ, PYTHONPATH=_REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(i), self.dir, *map(str, args)],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for i in range(count)
+        ]
+        results = [p.communicate() for p in procs]
+        return procs, results
+
+
+class CliDeliverEventsTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def run_cli(self, payload, state=None):
+        state = state or os.path.join(self.dir, "window")
+        return subprocess.run(
+            [sys.executable, "-m", "dedupe_window", "--state", state,
+             "deliver-events"],
+            capture_output=True, text=True, input=payload,
+        )
+
+    def test_delivery_flow_and_replay(self):
+        state = os.path.join(self.dir, "window")
+        payload = json.dumps({
+            "delivery_id": "d1",
+            "events": [{"key": "a", "timestamp": 0},
+                       {"key": "b", "timestamp": 5},
+                       {"key": "a", "timestamp": 2}],
+            "watermark": 10,
+        })
+        first = self.run_cli(payload, state)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stdout, '["admitted","admitted","duplicate"]\n')
+        path = os.path.join(state, "window.json")
+        before = open(path, "rb").read()
+        replay = self.run_cli(payload, state)
+        self.assertEqual((replay.returncode, replay.stdout), (0, first.stdout))
+        self.assertEqual(open(path, "rb").read(), before)
+        stats = subprocess.run(
+            [sys.executable, "-m", "dedupe_window", "--state", state, "stats"],
+            capture_output=True, text=True,
+        )
+        doc = json.loads(stats.stdout)
+        self.assertEqual((doc["retained"], doc["admitted"], doc["expired"]),
+                         (2, 2, 0))
+
+    def test_extra_fields_ignored(self):
+        result = self.run_cli(json.dumps({
+            "delivery_id": "d1",
+            "events": [{"key": "a", "timestamp": 0, "x": 1}],
+            "watermark": 0,
+            "note": "hi",
+        }))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '["admitted"]\n')
+
+    def test_empty_batch_commits_and_replays(self):
+        state = os.path.join(self.dir, "window")
+        payload = json.dumps({"delivery_id": "d1", "events": [], "watermark": 0})
+        first = self.run_cli(payload, state)
+        self.assertEqual((first.returncode, first.stdout), (0, "[]\n"))
+        self.assertTrue(os.path.exists(os.path.join(state, "window.json")))
+        again = self.run_cli(payload, state)
+        self.assertEqual((again.returncode, again.stdout), (0, "[]\n"))
+
+    def test_conflict_exits_1(self):
+        state = os.path.join(self.dir, "window")
+        self.run_cli(json.dumps({
+            "delivery_id": "d1",
+            "events": [{"key": "a", "timestamp": 0}],
+            "watermark": 5,
+        }), state)
+        result = self.run_cli(json.dumps({
+            "delivery_id": "d1",
+            "events": [{"key": "b", "timestamp": 0}],
+            "watermark": 5,
+        }), state)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith("delivery failed"))
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+
+    def test_watermark_regression_of_new_id_exits_1(self):
+        state = os.path.join(self.dir, "window")
+        self.run_cli(json.dumps(
+            {"delivery_id": "d1", "events": [], "watermark": 10}), state)
+        result = self.run_cli(json.dumps(
+            {"delivery_id": "d2", "events": [], "watermark": 9}), state)
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.startswith("delivery failed"))
+
+    def test_failures_exit_1_one_line_prefix_empty_stdout(self):
+        cases = {
+            "empty input": "",
+            "whitespace only": "  \n\t",
+            "not json": "{not json",
+            "json array": json.dumps([]),
+            "missing delivery_id": json.dumps({"events": [], "watermark": 0}),
+            "missing events": json.dumps({"delivery_id": "d", "watermark": 0}),
+            "missing watermark": json.dumps({"delivery_id": "d", "events": []}),
+            "numeric id": json.dumps(
+                {"delivery_id": 1, "events": [], "watermark": 0}),
+            "null id": json.dumps(
+                {"delivery_id": None, "events": [], "watermark": 0}),
+            "empty id": json.dumps(
+                {"delivery_id": "", "events": [], "watermark": 0}),
+            "events not list": json.dumps(
+                {"delivery_id": "d", "events": {}, "watermark": 0}),
+            "event missing key": json.dumps(
+                {"delivery_id": "d", "events": [{"timestamp": 0}],
+                 "watermark": 0}),
+            "bool watermark": json.dumps(
+                {"delivery_id": "d", "events": [], "watermark": True}),
+            "negative watermark": json.dumps(
+                {"delivery_id": "d", "events": [], "watermark": -1}),
+            "future event": json.dumps(
+                {"delivery_id": "d", "events": [{"key": "a", "timestamp": 6}],
+                 "watermark": 5}),
+            "trailing junk": '{"delivery_id":"d","events":[],"watermark":0} x',
+        }
+        for name, payload in cases.items():
+            state = os.path.join(self.dir, "case_" + name.replace(" ", "_"))
+            result = self.run_cli(payload, state)
+            self.assertEqual(result.returncode, 1, name)
+            self.assertEqual(result.stdout, "", name)
+            self.assertTrue(result.stderr.startswith("delivery failed"), name)
+            self.assertEqual(len(result.stderr.strip().splitlines()), 1, name)
+            self.assertFalse(os.path.exists(state), name)
+
+    def test_failure_keeps_old_state_byte_for_byte(self):
+        state = os.path.join(self.dir, "window")
+        self.run_cli(json.dumps({
+            "delivery_id": "keep",
+            "events": [{"key": "a", "timestamp": 0}],
+            "watermark": 0,
+        }), state)
+        path = os.path.join(state, "window.json")
+        before = open(path, "rb").read()
+        result = self.run_cli("{not json", state)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(open(path, "rb").read(), before)
+
+    def test_corrupt_state_exits_1_with_delivery_failed(self):
+        state = os.path.join(self.dir, "broken")
+        os.makedirs(state)
+        with open(os.path.join(state, "window.json"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("{broken")
+        result = self.run_cli(
+            json.dumps({"delivery_id": "d", "events": [], "watermark": 0}),
+            state,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(result.stderr.startswith("delivery failed"))
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+
+    def test_operand_is_a_usage_error_exit_2(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "dedupe_window",
+             "--state", os.path.join(self.dir, "w"), "deliver-events", "x"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("usage", result.stderr.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

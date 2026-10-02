@@ -19,6 +19,7 @@ Python 3.11 or newer. Standard library only.
     python3 -m dedupe_window --state ./window restore
     python3 -m dedupe_window --state ./window observe-batch
     python3 -m dedupe_window --state ./window observe-events
+    python3 -m dedupe_window --state ./window deliver-events
 
 `observe-batch` reads one JSON array of strings from standard input (surrounding
 whitespace is allowed) and writes one compact JSON line of booleans, one per
@@ -59,6 +60,33 @@ with one `event batch failed` line on standard error and an empty standard
 output, leaving the state and directory untouched; a wrong number of command
 arguments exits 2 with the usage message.
 
+`deliver-events` adds batch-level idempotency on top of `observe-events`. It
+reads one JSON object from standard input, e.g.
+`{"delivery_id":"batch-42","events":[{"key":"a","timestamp":12}],"watermark":20}`
+(extra fields are ignored), and writes the same compact JSON line of
+per-event classifications. The first delivery of an identifier behaves exactly
+like `observe-events`, except that the event changes and a delivery receipt
+always share one commit -- even an empty or all-duplicate batch commits, so
+the receipt is durable. The window retains the most recent 128 distinct
+delivery identifiers in first-commit order; replays never refresh that order,
+and neither time advancement nor key eviction retires a receipt. A later
+delivery naming a retained identifier with the same watermark and the same
+ordered key/timestamp contents (numerically equal ints and floats are
+equivalent) replays the original classifications without changing time,
+counts or files -- even when the original watermark has fallen behind the
+current time. The same identifier with different contents fails. Once an
+identifier has been evicted it is treated as a brand-new request, so a
+watermark behind the current time is rejected again. The identifier is
+compared as the exact string: a non-string `delivery_id` and an empty one
+fail. Bad JSON, a missing field, a bad type, an out-of-range time, a content
+conflict, watermark regression by a new identifier, corrupt state or an I/O
+failure exits 1 with one `delivery failed` line on standard error and an
+empty standard output, leaving the state and directory untouched; a wrong
+number of command arguments exits 2 with the usage message. Receipts persist
+in `window.json` and ride along in `export`/`restore`, so a replay works
+after a restart and after moving state; commits that predate any delivery
+export exactly as before.
+
 `export <seq>` writes the complete self-checking document of commit `seq`
 (numbered from 1) as one JSON object on standard output, without changing the
 state. `restore` reads exactly one such document from standard input and
@@ -80,16 +108,17 @@ document, and never creates or partly modifies the state in that case.
 
 `dedupe_window.Window(state, span, capacity)` opens the window directory `state`.
 Constructing a `Window` never creates the directory or the data file; only a
-mutation (`observe`/`observe_many`/`observe_events`/`advance`/`restore`) does. Read-only calls on a window that
+mutation (`observe`/`observe_many`/`observe_events`/`deliver_events`/`advance`/`restore`) does. Read-only calls on a window that
 has never committed answer from the empty state and leave the filesystem alone.
 - `observe(key) -> bool` records a sighting and returns whether the key was newly admitted.
 - `observe_many(keys) -> list[bool]` records a list of string keys as one atomic batch, returning one boolean per input item in order; all items use the current time at the batch start, time is not advanced, an evicted key reappearing within the batch is readmitted, and only a batch that admits something adds one commit. A non-list or a non-string element raises `TypeError`; an empty list returns `[]` without touching the filesystem; a corrupt state or settings mismatch on a valid non-empty batch raises `ValueError` without overwriting the state.
 - `observe_events(events, watermark) -> list[str]` processes one out-of-order event batch atomically. `events` is a list of objects with string `key` and numeric `timestamp`; it returns one `"admitted"`/`"duplicate"`/`"late"` string per event in input order. The batch first moves time to `watermark` and expires the span, then classifies each event: `watermark - timestamp > span` is `late` (checked before duplicates; the boundary is valid), a retained key is `duplicate` (no time/order refresh), anything else is `admitted` at the event timestamp. Keys stay ordered by first sighting, ties by admission order; a full window evicts the current oldest key, which can be readmitted later in the same batch. Only admissions grow `admitted` and only time expiry grows `expired`; one commit is added when the watermark moves, an expiry occurs or an event is admitted (an empty list still advances/expires). A wrong argument type raises `TypeError`; a missing field, non-finite or negative time, future event, watermark regression, corrupt state or settings mismatch raises `ValueError`; either leaves the window state and any existing file unchanged and a failed validation creates no directory.
+- `deliver_events(delivery_id, events, watermark) -> list[str]` processes one event batch as an idempotent named delivery. The first delivery of `delivery_id` behaves exactly like `observe_events` and commits the event changes together with a receipt, even when the batch is empty or all duplicates. The most recent 128 distinct identifiers are retained in first-commit order; replays never refresh that order and neither time advancement nor key eviction retires a receipt. Redelivering a retained identifier with the same watermark and ordered key/timestamp contents (equal ints and floats are equivalent) returns the original classifications and changes nothing — time, counts and files included — even if the watermark has fallen behind; the same identifier with different contents raises `ValueError`. An evicted identifier is a new request, so a regressed watermark raises `ValueError` again. A non-string `delivery_id` raises `TypeError`, an empty one `ValueError`; every other input error follows `observe_events`, validation completes before the replay check, and a failed validation creates no directory and changes nothing.
 - `seen(key) -> bool` reports membership without recording anything.
 - `advance(now) -> int` drops everything older than the span and returns how many keys went.
 - `keys() -> list[str]` retained keys, oldest sighting first.
 - `stats() -> dict` reports span, capacity, retained, admitted and expired counts.
-- `export(seq) -> dict` returns the complete state of commit `seq` (commits are numbered from 1 in arrival order): retained keys in order, counts, current time, settings, the commit number and a checksum. The document is self-checking and survives a JSON round trip unchanged. A non-integer `seq` (booleans included) raises `TypeError`; a non-positive, never-committed or no-longer-locatable number raises `ValueError`.
+- `export(seq) -> dict` returns the complete state of commit `seq` (commits are numbered from 1 in arrival order): retained keys in order, counts, current time, settings, the commit number, the delivery receipts the commit holds (only once it holds any) and a checksum. The document is self-checking and survives a JSON round trip unchanged. A non-integer `seq` (booleans included) raises `TypeError`; a non-positive, never-committed or no-longer-locatable number raises `ValueError`.
 - `restore(document) -> None` atomically resets the whole window to an exported state; key order, counts, time and settings match the document and later commits continue from the exported commit's successor. Anything that is not an export document raises `TypeError`; a missing/mistyped field or a bad checksum raises `ValueError`.
 - `save() -> None` and `load() -> None` persist the window and re-read it before replacing memory.
 

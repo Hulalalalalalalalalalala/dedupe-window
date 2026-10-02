@@ -16,7 +16,7 @@ DEFAULT_CAPACITY = 1024
 USAGE = (
     "usage: python3 -m dedupe_window --state <dir> "
     "{observe <key> | seen <key> | stats | export <seq> | restore"
-    " | observe-batch | observe-events}"
+    " | observe-batch | observe-events | deliver-events}"
 )
 
 # A decimal commit number: one or more decimal digits, optionally signed with
@@ -50,6 +50,11 @@ def _event_batch_failed(reason):
     raise SystemExit(1)
 
 
+def _delivery_failed(reason):
+    print(f"delivery failed: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
 def _parse(argv):
     state = None
     rest = []
@@ -73,7 +78,8 @@ def _parse(argv):
     if command in ("observe", "seen", "export"):
         if len(operands) != 1:
             _usage()
-    elif command in ("stats", "restore", "observe-batch", "observe-events"):
+    elif command in ("stats", "restore", "observe-batch", "observe-events",
+                     "deliver-events"):
         if operands:
             _usage()
     else:
@@ -168,6 +174,44 @@ def _run_observe_batch(state):
     sys.stdout.write(json.dumps(hits, separators=(",", ":")) + "\n")
 
 
+def _event_batch_fields(document, fail):
+    """Validate the events/watermark fields of one decoded JSON object.
+
+    ``fail`` is the command's error exit (its own ``... failed`` prefix).
+    Returns ``(prepared, watermark)`` where prepared holds one
+    ``{"key", "timestamp"}`` object per input event; extra fields are
+    ignored.
+    """
+    if not isinstance(document, dict) or "events" not in document \
+            or "watermark" not in document:
+        fail("input must be one JSON object with events and watermark")
+    events = document["events"]
+    watermark = document["watermark"]
+    if not isinstance(events, list):
+        fail("events must be a JSON array")
+    if not isinstance(watermark, (int, float)) or isinstance(watermark, bool):
+        fail("watermark must be an int or float")
+    if not math.isfinite(watermark) or watermark < 0:
+        fail("watermark must be finite and non-negative")
+    prepared = []
+    for event in events:
+        if not isinstance(event, dict) or "key" not in event \
+                or "timestamp" not in event:
+            fail("each event must be an object with key and timestamp")
+        key = event["key"]
+        timestamp = event["timestamp"]
+        if not isinstance(key, str):
+            fail("event key must be a string")
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+            fail("event timestamp must be an int or float")
+        if not math.isfinite(timestamp) or timestamp < 0:
+            fail("event timestamp must be finite and non-negative")
+        if timestamp > watermark:
+            fail("event timestamp is later than the watermark")
+        prepared.append({"key": key, "timestamp": timestamp})
+    return prepared, watermark
+
+
 def _run_observe_events(state):
     """Atomically process one event-time batch read from stdin.
 
@@ -185,33 +229,7 @@ def _run_observe_events(state):
     except ValueError as exc:
         # Covers an empty input, malformed JSON and trailing junk.
         _event_batch_failed(f"input is not one JSON object: {exc}")
-    if not isinstance(document, dict) or "events" not in document \
-            or "watermark" not in document:
-        _event_batch_failed("input must be one JSON object with events and watermark")
-    events = document["events"]
-    watermark = document["watermark"]
-    if not isinstance(events, list):
-        _event_batch_failed("events must be a JSON array")
-    if not isinstance(watermark, (int, float)) or isinstance(watermark, bool):
-        _event_batch_failed("watermark must be an int or float")
-    if not math.isfinite(watermark) or watermark < 0:
-        _event_batch_failed("watermark must be finite and non-negative")
-    prepared = []
-    for event in events:
-        if not isinstance(event, dict) or "key" not in event \
-                or "timestamp" not in event:
-            _event_batch_failed("each event must be an object with key and timestamp")
-        key = event["key"]
-        timestamp = event["timestamp"]
-        if not isinstance(key, str):
-            _event_batch_failed("event key must be a string")
-        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
-            _event_batch_failed("event timestamp must be an int or float")
-        if not math.isfinite(timestamp) or timestamp < 0:
-            _event_batch_failed("event timestamp must be finite and non-negative")
-        if timestamp > watermark:
-            _event_batch_failed("event timestamp is later than the watermark")
-        prepared.append({"key": key, "timestamp": timestamp})
+    prepared, watermark = _event_batch_fields(document, _event_batch_failed)
     # Open with the persisted settings so a settings mismatch cannot arise;
     # the method itself creates the directory only when the batch actually
     # has to commit.  Every failure (creating the directory, reading the
@@ -225,6 +243,53 @@ def _run_observe_events(state):
         kinds = window.observe_events(prepared, watermark)
     except (TypeError, ValueError, OSError) as exc:
         _event_batch_failed(str(exc))
+    sys.stdout.write(json.dumps(kinds, separators=(",", ":")) + "\n")
+
+
+def _run_deliver_events(state):
+    """Atomically process one idempotent named delivery read from stdin.
+
+    The input is exactly one JSON object holding a ``delivery_id`` string,
+    an ``events`` list and a ``watermark``; extra fields are ignored.  The
+    first delivery of an identifier behaves like ``observe-events`` and
+    commits the event changes together with a receipt; a later delivery
+    naming a retained identifier with identical content replays the
+    original per-item results without changing anything, and the same
+    identifier with different content fails.  Input types and ranges are
+    validated before any filesystem call, so an invalid input creates no
+    directory and leaves an existing state byte for byte unchanged.  On
+    success stdout holds one compact JSON line of per-item results.  Any
+    failure exits 1 with one ``delivery failed`` line on stderr and an
+    empty stdout.
+    """
+    raw = sys.stdin.buffer.read()
+    try:
+        document = json.loads(raw)
+    except ValueError as exc:
+        # Covers an empty input, malformed JSON and trailing junk.
+        _delivery_failed(f"input is not one JSON object: {exc}")
+    if not isinstance(document, dict) or "delivery_id" not in document:
+        _delivery_failed(
+            "input must be one JSON object with delivery_id, events and watermark"
+        )
+    delivery_id = document["delivery_id"]
+    if not isinstance(delivery_id, str):
+        _delivery_failed("delivery_id must be a string")
+    if not delivery_id:
+        _delivery_failed("delivery_id must not be empty")
+    prepared, watermark = _event_batch_fields(document, _delivery_failed)
+    # Open with the persisted settings so a settings mismatch cannot arise;
+    # every failure (creating the directory, reading the data file) is a
+    # delivery failure, never the generic corruption text.
+    path = os.path.join(state, "window.json")
+    span, capacity = DEFAULT_SPAN, DEFAULT_CAPACITY
+    try:
+        if os.path.exists(path):
+            span, capacity = read_settings(path)
+        window = Window(state, span, capacity)
+        kinds = window.deliver_events(delivery_id, prepared, watermark)
+    except (TypeError, ValueError, OSError) as exc:
+        _delivery_failed(str(exc))
     sys.stdout.write(json.dumps(kinds, separators=(",", ":")) + "\n")
 
 
@@ -248,7 +313,7 @@ def _run_restore(state):
     try:
         # Pure validation only: no directory or file may be touched until the
         # document is known to be a valid checkpoint.
-        _seq, span, capacity, _now, _admitted, _expired, _entries = (
+        _seq, span, capacity, _now, _admitted, _expired, _entries, _receipts = (
             Window._check_restore_document(document)
         )
         window = Window(state, span, capacity)
@@ -284,6 +349,8 @@ def main(argv=None):
         _run_observe_batch(state)
     elif command == "observe-events":
         _run_observe_events(state)
+    elif command == "deliver-events":
+        _run_deliver_events(state)
     else:
         # Pure read: never create the directory, never touch the data file.
         if not os.path.exists(path):
