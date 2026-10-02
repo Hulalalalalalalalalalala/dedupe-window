@@ -482,8 +482,8 @@ def _apply_v3_delta(line, state, index, max_first):
     if not isinstance(document, dict) or document.get("kind") != "delta":
         raise ValueError("state file holds a malformed segment")
     body = _verified_body(document, "state file segment")
-    fields = ("seq", "prev", "op", "now", "admitted", "expired", "drop", "add")
-    if any(field not in body for field in fields):
+    common = ("seq", "prev", "op")
+    if any(field not in body for field in common):
         raise ValueError("state file holds a malformed segment")
     seg_seq = body["seq"]
     if not isinstance(seg_seq, int) or isinstance(seg_seq, bool) or seg_seq <= 0:
@@ -493,6 +493,13 @@ def _apply_v3_delta(line, state, index, max_first):
     if body["prev"] != state["tip"]:
         raise ValueError("state file segment chain is broken")
     op = body["op"]
+    if op == "batch":
+        return _apply_v3_batch_delta(
+            body, state, index, max_first, document["checksum"]
+        )
+    fields = ("now", "admitted", "expired", "drop", "add")
+    if any(field not in body for field in fields):
+        raise ValueError("state file holds a malformed segment")
     if op not in ("admit", "sweep"):
         raise ValueError("state file holds a malformed segment")
     new_now = body["now"]
@@ -545,6 +552,70 @@ def _apply_v3_delta(line, state, index, max_first):
     state["seq"] = seg_seq
     state["tip"] = document["checksum"]
     return max_first
+
+
+def _apply_v3_batch_delta(body, state, index, max_first, checksum):
+    """Validate and replay one v3 atomic batch segment.
+
+    A batch records the input keys and the per-item admission results; the
+    post-commit retained set is fully determined by replaying the inputs
+    against the pre-batch state, so replay recomputes it and cross-checks
+    every stored field, including keys admitted and evicted again within the
+    same commit.
+    """
+    fields = ("now", "admitted", "expired", "keys", "hits")
+    if any(field not in body for field in fields):
+        raise ValueError("state file holds a malformed segment")
+    now = body["now"]
+    if not _is_number(now) or now != state["now"]:
+        raise ValueError("state file batch segment moves the current time")
+    new_admitted = body["admitted"]
+    new_expired = body["expired"]
+    if not _is_count(new_admitted) or not _is_count(new_expired):
+        raise ValueError("state file segment has an invalid count")
+    raw_keys = body["keys"]
+    raw_hits = body["hits"]
+    if (
+        not isinstance(raw_keys, list)
+        or not raw_keys
+        or not all(isinstance(key, str) for key in raw_keys)
+        or not isinstance(raw_hits, list)
+        or len(raw_hits) != len(raw_keys)
+        or not all(isinstance(hit, bool) for hit in raw_hits)
+    ):
+        raise ValueError("state file batch segment is malformed")
+    simulated = [list(pair) for pair in state["entries"]]
+    simulated_index = set(index)
+    expected_hits = []
+    capacity = state["capacity"]
+    for key in raw_keys:
+        if key in simulated_index:
+            expected_hits.append(False)
+            continue
+        expected_hits.append(True)
+        while len(simulated) >= capacity:
+            oldest, _ = simulated.pop(0)
+            simulated_index.discard(oldest)
+        simulated.append([key, now])
+        simulated_index.add(key)
+    if raw_hits != expected_hits:
+        raise ValueError("state file batch segment results are inconsistent")
+    admitted_count = sum(1 for hit in expected_hits if hit)
+    if new_admitted != state["admitted"] + admitted_count:
+        raise ValueError("state file segment counts are inconsistent")
+    if new_expired != state["expired"]:
+        # Capacity eviction inside a batch is never an expiry.
+        raise ValueError("state file segment counts are inconsistent")
+    if len(simulated) > capacity:
+        raise ValueError("state file holds more keys than the capacity allows")
+    state["entries"] = simulated
+    index.clear()
+    index.update(simulated_index)
+    state["admitted"] = new_admitted
+    state["expired"] = new_expired
+    state["seq"] = body["seq"]
+    state["tip"] = checksum
+    return simulated[-1][1] if simulated else max_first
 
 
 def _state_from_anchor(info):
@@ -964,6 +1035,54 @@ class Window:
         self._admitted += 1
         return True, evicted
 
+    def observe_many(self, keys):
+        """Record a batch of sightings as one atomic commit.
+
+        ``keys`` must be a list of strings; the returned list of booleans
+        aligns item by item with the input.  Semantics per item match
+        :meth:`observe`, but every item uses the current time of the latest
+        committed state at the start of the batch -- time never advances on
+        its own -- and a key evicted by capacity earlier in the same batch is
+        admitted again if it reappears.  Repeats never refresh a key's first
+        sighting or its order.
+
+        Validation runs before any filesystem access: a non-list or a
+        non-string element raises ``TypeError`` and creates neither the
+        state directory nor the data file; an empty list returns ``[]``
+        without reading or creating state.  A valid, non-empty batch that
+        meets a corrupt state or a settings mismatch raises ``ValueError``
+        and leaves the original state untouched.  When at least one item is
+        admitted the batch adds exactly one commit; an all-duplicate batch
+        commits nothing.
+        """
+        if not isinstance(keys, list):
+            raise TypeError("keys must be a list of strings")
+        if not all(isinstance(key, str) for key in keys):
+            raise TypeError("keys must be a list of strings")
+        if not keys:
+            return []
+        self._ensure_dir()
+        with self._locked(True):
+            self._reload_if_present()
+            now = self._now
+            hits = []
+            any_admitted = False
+            for key in keys:
+                if key in self._index:
+                    hits.append(False)
+                    continue
+                hits.append(True)
+                any_admitted = True
+                while len(self._entries) >= self._capacity:
+                    oldest, _ = self._entries.pop(0)
+                    del self._index[oldest]
+                self._entries.append([key, now])
+                self._index[key] = now
+                self._admitted += 1
+            if any_admitted:
+                self._commit("batch", [], [], batch_keys=keys, batch_hits=hits)
+            return hits
+
     def advance(self, now):
         """Move the current time to ``now`` and drop keys older than the span.
 
@@ -1344,7 +1463,7 @@ class Window:
             os.close(fd)
         return envelope["checksum"], data
 
-    def _commit(self, op, drop, add):
+    def _commit(self, op, drop, add, batch_keys=(), batch_hits=()):
         """Commit the in-memory state as the next commit; caller holds lock."""
         self._sweep_temp_files()
         if self._needs_anchor():
@@ -1374,9 +1493,16 @@ class Window:
             "now": self._now,
             "admitted": self._admitted,
             "expired": self._expired,
-            "drop": list(drop),
-            "add": [list(pair) for pair in add],
         }
+        if op == "batch":
+            # The full inputs and per-item results make the post-commit set
+            # fully derivable by replay, including keys evicted and readmitted
+            # within this same commit.
+            body["keys"] = list(batch_keys)
+            body["hits"] = list(batch_hits)
+        else:
+            body["drop"] = list(drop)
+            body["add"] = [list(pair) for pair in add]
         checksum, data = self._append_record(body)
         self._seq += 1
         self._last_commit = checksum

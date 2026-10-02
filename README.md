@@ -17,6 +17,20 @@ Python 3.11 or newer. Standard library only.
     python3 -m dedupe_window --state ./window stats
     python3 -m dedupe_window --state ./window export <seq>
     python3 -m dedupe_window --state ./window restore
+    python3 -m dedupe_window --state ./window observe-batch
+
+`observe-batch` reads one JSON array of strings from standard input (surrounding
+whitespace is allowed) and writes one compact JSON line of booleans, one per
+input item in order. The whole batch is one atomic commit: every item uses the
+current time at the start of the batch, repeats do not refresh time or order,
+capacity eviction removes the oldest retained key, and a key evicted earlier in
+the same batch is admitted again if it reappears. `admitted` grows by the
+number of `true` results; capacity evictions never count as `expired`. A batch
+with at least one admission adds exactly one commit; an all-duplicate batch
+commits nothing; an empty array prints `[]` without reading or creating state.
+A missing data file, bad JSON, a non-array, a non-string element or trailing
+non-whitespace exits 1 with one `batch failed` line on standard error, an empty
+standard output and an unchanged state (no directory is created).
 
 `export <seq>` writes the complete self-checking document of commit `seq`
 (numbered from 1) as one JSON object on standard output, without changing the
@@ -42,6 +56,7 @@ Constructing a `Window` never creates the directory or the data file; only a
 mutation (`observe`/`advance`/`restore`) does. Read-only calls on a window that
 has never committed answer from the empty state and leave the filesystem alone.
 - `observe(key) -> bool` records a sighting and returns whether the key was newly admitted.
+- `observe_many(keys) -> list[bool]` records a list of string keys as one atomic batch, returning one boolean per input item in order; all items use the current time at the batch start, time is not advanced, an evicted key reappearing within the batch is readmitted, and only a batch that admits something adds one commit. A non-list or a non-string element raises `TypeError`; an empty list returns `[]` without touching the filesystem; a corrupt state or settings mismatch on a valid non-empty batch raises `ValueError` without overwriting the state.
 - `seen(key) -> bool` reports membership without recording anything.
 - `advance(now) -> int` drops everything older than the span and returns how many keys went.
 - `keys() -> list[str]` retained keys, oldest sighting first.
